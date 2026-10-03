@@ -1,0 +1,270 @@
+using System.Globalization;
+using System.Text;
+using IphoneMover.Wpd;
+
+namespace IphoneMover.Core;
+
+internal enum FileState
+{
+    Copying,
+    Moved,          // copied, checked, deleted from phone
+    Copied,         // copied and checked, not deleted (by choice or because of a rule)
+    Failed,         // copy, check or delete failed; the file is still on the phone
+}
+
+internal sealed record FileReport(DeviceFile File, FileState State, string Detail, string? PcPath);
+
+internal sealed class MoveSummary
+{
+    public int Moved;
+    public int CopiedOnly;
+    public int Failed;
+    public long Bytes;
+}
+
+/// <summary>
+/// Moves files from the phone to the PC. For every asset group:
+/// 1. copy each file to "&lt;name&gt;.part", 2. check size and format, 3. rename to the final name,
+/// 4. only if every file of the group passed: delete the group from the phone.
+/// </summary>
+internal sealed class MoveEngine(
+    WpdDevice device,
+    string destinationRoot,
+    bool deleteAfterCopy,
+    IProgress<FileReport> report,
+    Action<long> onBytes)
+{
+    public const string LogFileName = "iphone-mover-log.csv";
+
+    private const string KeepOriginalsHint =
+        " Tip: on the iPhone set Settings > Photos > Transfer to Mac or PC = \"Keep Originals\".";
+    private const string ReadOnlyHint =
+        " The phone refused. Is iCloud Photos turned on? Then the phone does not allow delete over USB.";
+
+    private long bytesDone;
+
+    public MoveSummary Run(IReadOnlyList<List<DeviceFile>> groups, CancellationToken ct)
+    {
+        var summary = new MoveSummary();
+        Directory.CreateDirectory(destinationRoot);
+        using var log = OpenLog();
+
+        foreach (var group in groups)
+        {
+            ct.ThrowIfCancellationRequested();
+
+            // Step 1-3: copy and check every file of the group.
+            var copied = new List<(DeviceFile File, string PcPath, CheckResult Check)>();
+            bool groupOk = true;
+            foreach (var file in group)
+            {
+                ct.ThrowIfCancellationRequested();
+                report.Report(new FileReport(file, FileState.Copying, "copying...", null));
+                try
+                {
+                    var (pcPath, check, note) = CopyAndCheck(file, ct);
+                    copied.Add((file, pcPath, check));
+                    if (check.Status != CheckStatus.Valid)
+                        groupOk = false;
+                    summary.Bytes += file.Size;
+                    WriteLog(log, file, pcPath, "copied", note + check.Detail);
+                }
+                catch (OperationCanceledException)
+                {
+                    throw;
+                }
+                catch (Exception ex)
+                {
+                    groupOk = false;
+                    summary.Failed++;
+                    report.Report(new FileReport(file, FileState.Failed, ex.Message, null));
+                    WriteLog(log, file, "", "FAILED", ex.Message);
+                }
+            }
+
+            // Step 4: delete from the phone only when the whole group is safe on the PC.
+            foreach (var (file, pcPath, check) in copied)
+            {
+                if (!deleteAfterCopy)
+                {
+                    summary.CopiedOnly++;
+                    report.Report(new FileReport(file, FileState.Copied, "copied, " + check.Detail, pcPath));
+                    continue;
+                }
+                if (!groupOk)
+                {
+                    summary.CopiedOnly++;
+                    string why = check.Status == CheckStatus.NotSupported
+                        ? $"copied but NOT deleted: {check.Detail}"
+                        : "copied but NOT deleted: another file of the same photo failed";
+                    report.Report(new FileReport(file, FileState.Copied, why, pcPath));
+                    WriteLog(log, file, pcPath, "kept on phone", why);
+                    continue;
+                }
+
+                string? error = DeleteFromPhone(file);
+                if (error is null)
+                {
+                    summary.Moved++;
+                    report.Report(new FileReport(file, FileState.Moved, "moved, " + check.Detail, pcPath));
+                    WriteLog(log, file, pcPath, "deleted from phone", "");
+                }
+                else
+                {
+                    summary.Failed++;
+                    report.Report(new FileReport(file, FileState.Failed, "copied, but " + error, pcPath));
+                    WriteLog(log, file, pcPath, "DELETE FAILED", error);
+                }
+            }
+        }
+        return summary;
+    }
+
+    private (string PcPath, CheckResult Check, string Note) CopyAndCheck(DeviceFile file, CancellationToken ct)
+    {
+        if (file.Size < 0)
+            throw new IOException("the phone did not report the file size, so the copy cannot be checked");
+
+        string ext = Path.GetExtension(file.Name);
+        string dir = Path.Combine(destinationRoot, SafeRelativeFolder(file.Folder));
+        Directory.CreateDirectory(dir);
+        string dest = Path.Combine(dir, SafeName(file.Name));
+
+        // Resume: the same file is already on the PC from an earlier run.
+        if (File.Exists(dest))
+        {
+            if (new FileInfo(dest).Length == file.Size)
+            {
+                var existing = FormatValidator.Check(dest, ext);
+                if (existing.Status != CheckStatus.Invalid)
+                {
+                    bytesDone += file.Size;
+                    onBytes(bytesDone);
+                    return (dest, existing, "already on PC; ");
+                }
+            }
+            dest = UniqueName(dest);
+        }
+
+        var drive = new DriveInfo(Path.GetPathRoot(Path.GetFullPath(dest))!);
+        if (drive.AvailableFreeSpace < file.Size + 50L * 1024 * 1024)
+            throw new IOException($"not enough free space on {drive.Name}");
+
+        string part = dest + ".part";
+        File.Delete(part);
+        long written;
+        long startBytes = bytesDone;
+        try
+        {
+            using (var fs = new FileStream(part, FileMode.CreateNew, FileAccess.Write, FileShare.None, 1 << 20))
+            {
+                written = device.Download(file.ObjectId, fs, n => onBytes(startBytes + n), ct);
+                fs.Flush(flushToDisk: true);
+            }
+
+            if (written != file.Size)
+                throw new IOException($"size mismatch: phone says {file.Size:N0} bytes, received {written:N0}." + KeepOriginalsHint);
+            long onDisk = new FileInfo(part).Length;
+            if (onDisk != file.Size)
+                throw new IOException($"size mismatch: phone says {file.Size:N0} bytes, file on PC has {onDisk:N0}");
+
+            var check = FormatValidator.Check(part, ext);
+            if (check.Status == CheckStatus.Invalid)
+                throw new IOException("format check failed: " + check.Detail);
+
+            File.Move(part, dest);
+            SetTimes(dest, file);
+            bytesDone = startBytes + file.Size;
+            onBytes(bytesDone);
+            return (dest, check, "");
+        }
+        catch
+        {
+            TryDelete(part);
+            bytesDone = startBytes;
+            throw;
+        }
+    }
+
+    /// <summary>Returns null on success, or an error text.</summary>
+    private string? DeleteFromPhone(DeviceFile file)
+    {
+        if (!file.CanDelete)
+            return "NOT deleted: the phone marks this file as read-only." + ReadOnlyHint;
+
+        int hr = device.Delete(file.ObjectId);
+        if (HResult.IsNotFound(hr))
+            return null; // iOS already removed it together with another file of the same photo
+        if (hr == HResult.S_FALSE)
+            return "NOT deleted: the phone refused." + ReadOnlyHint;
+        if (hr < 0)
+            return "NOT deleted: " + WpdException.Describe(hr) + (hr == HResult.E_ACCESSDENIED ? ReadOnlyHint : "");
+        if (device.Exists(file.ObjectId))
+            return "NOT deleted: the phone said OK but the file is still there." + ReadOnlyHint;
+        return null;
+    }
+
+    // ------------------------------------------------------------------ helpers
+
+    internal static string SafeName(string name)
+    {
+        var invalid = Path.GetInvalidFileNameChars();
+        var sb = new StringBuilder(name.Length);
+        foreach (char c in name)
+            sb.Append(Array.IndexOf(invalid, c) >= 0 ? '_' : c);
+        string s = sb.ToString().Trim().TrimEnd('.');
+        return s.Length == 0 || s == ".." ? "_" : s;
+    }
+
+    internal static string SafeRelativeFolder(string folder) =>
+        Path.Combine(folder.Split('\\', '/', StringSplitOptions.RemoveEmptyEntries).Select(SafeName).ToArray());
+
+    internal static string UniqueName(string path)
+    {
+        string dir = Path.GetDirectoryName(path)!;
+        string stem = Path.GetFileNameWithoutExtension(path);
+        string ext = Path.GetExtension(path);
+        for (int i = 2; ; i++)
+        {
+            string candidate = Path.Combine(dir, $"{stem} ({i}){ext}");
+            if (!File.Exists(candidate) && !File.Exists(candidate + ".part"))
+                return candidate;
+        }
+    }
+
+    private static void SetTimes(string path, DeviceFile file)
+    {
+        try
+        {
+            if (file.Created is DateTime c)
+                File.SetCreationTime(path, c);
+            if ((file.Modified ?? file.Created) is DateTime m)
+                File.SetLastWriteTime(path, m);
+        }
+        catch (IOException) { }
+        catch (UnauthorizedAccessException) { }
+    }
+
+    private static void TryDelete(string path)
+    {
+        try { File.Delete(path); } catch (IOException) { } catch (UnauthorizedAccessException) { }
+    }
+
+    private StreamWriter OpenLog()
+    {
+        string path = Path.Combine(destinationRoot, LogFileName);
+        bool isNew = !File.Exists(path);
+        var w = new StreamWriter(path, append: true, new UTF8Encoding(true)) { AutoFlush = true };
+        if (isNew)
+            w.WriteLine("time,phone_path,pc_path,size,result,detail");
+        return w;
+    }
+
+    private static void WriteLog(StreamWriter log, DeviceFile file, string pcPath, string result, string detail)
+    {
+        static string Q(string s) => "\"" + s.Replace("\"", "\"\"") + "\"";
+        log.WriteLine(string.Join(",",
+            DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture),
+            Q(file.DevicePath), Q(pcPath), file.Size.ToString(CultureInfo.InvariantCulture), Q(result), Q(detail)));
+    }
+}

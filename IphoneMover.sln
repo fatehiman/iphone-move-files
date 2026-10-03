@@ -1,0 +1,36 @@
+﻿
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "src", "src", "{F91FF961-9ACF-4BCE-AE12-97F7BE2B4C14}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "IphoneMover", "src\IphoneMover\IphoneMover.csproj", "{7C9B8648-8640-4D76-9F7F-17D31B8EEEED}"
+EndProject
+Project("{2150E333-8FDC-42A3-9474-1A3956D46DE8}") = "tests", "tests", "{4B2F4C5B-D15E-449A-B5CB-54D101D3F2FF}"
+EndProject
+Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "IphoneMover.Tests", "tests\IphoneMover.Tests\IphoneMover.Tests.csproj", "{732678E9-CF77-45BE-8193-9913D2F8CE81}"
+EndProject
+Global
+	GlobalSection(SolutionConfigurationPlatforms) = preSolution
+		Debug|Any CPU = Debug|Any CPU
+		Release|Any CPU = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(SolutionProperties) = preSolution
+		HideSolutionNode = FALSE
+	EndGlobalSection
+	GlobalSection(ProjectConfigurationPlatforms) = postSolution
+		{7C9B8648-8640-4D76-9F7F-17D31B8EEEED}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{7C9B8648-8640-4D76-9F7F-17D31B8EEEED}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{7C9B8648-8640-4D76-9F7F-17D31B8EEEED}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{7C9B8648-8640-4D76-9F7F-17D31B8EEEED}.Release|Any CPU.Build.0 = Release|Any CPU
+		{732678E9-CF77-45BE-8193-9913D2F8CE81}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{732678E9-CF77-45BE-8193-9913D2F8CE81}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{732678E9-CF77-45BE-8193-9913D2F8CE81}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{732678E9-CF77-45BE-8193-9913D2F8CE81}.Release|Any CPU.Build.0 = Release|Any CPU
+	EndGlobalSection
+	GlobalSection(NestedProjects) = preSolution
+		{7C9B8648-8640-4D76-9F7F-17D31B8EEEED} = {F91FF961-9ACF-4BCE-AE12-97F7BE2B4C14}
+		{732678E9-CF77-45BE-8193-9913D2F8CE81} = {4B2F4C5B-D15E-449A-B5CB-54D101D3F2FF}
+	EndGlobalSection
+EndGlobal
