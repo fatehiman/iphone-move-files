@@ -1,5 +1,7 @@
 using System.Collections;
+using System.Diagnostics;
 using System.Globalization;
+using System.Runtime.InteropServices;
 using IphoneMover.Core;
 using IphoneMover.Wpd;
 
@@ -10,16 +12,24 @@ internal sealed class MainForm : Form
     // top
     private readonly ComboBox deviceCombo = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 320 };
     private readonly Button findDevicesButton = new() { Text = "Find devices", AutoSize = true };
-    private readonly Button loadFilesButton = new() { Text = "Load files from phone", AutoSize = true };
+    private readonly Button loadFilesButton = new() { Text = "Reload files from phone", AutoSize = true };
 
     // left: phone
+    private readonly RadioButton folderViewRadio = new() { Text = "Folders", AutoSize = true, Padding = new Padding(0, 4, 0, 0) };
+    private readonly RadioButton fileViewRadio = new() { Text = "Files", AutoSize = true, Padding = new Padding(0, 4, 0, 0) };
+    private readonly Panel fileFilterPanel = new() { AutoSize = true, AutoSizeMode = AutoSizeMode.GrowAndShrink, Margin = Padding.Empty };
+    private readonly ComboBox folderCombo = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 300, MaxDropDownItems = 30 };
+    private readonly ListView folderList = new()
+    {
+        Dock = DockStyle.Fill, View = View.Details, CheckBoxes = true, FullRowSelect = true,
+        HideSelection = false, GridLines = true,
+    };
     private readonly ListView phoneList = new()
     {
         Dock = DockStyle.Fill, View = View.Details, CheckBoxes = true, FullRowSelect = true,
         HideSelection = false, GridLines = true,
     };
     private readonly Label phoneCountLabel = new() { AutoSize = true, Padding = new Padding(0, 6, 0, 0) };
-    private readonly ComboBox folderCombo = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 300, MaxDropDownItems = 30 };
 
     // right: PC
     private readonly ComboBox driveCombo = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 260 };
@@ -27,7 +37,9 @@ internal sealed class MainForm : Form
     private readonly ListView pcList = new()
     {
         Dock = DockStyle.Fill, View = View.Details, FullRowSelect = true, HideSelection = false, GridLines = true,
+        MultiSelect = true,
     };
+    private readonly ContextMenuStrip pcMenu = new();
 
     // bottom
     private readonly CheckBox deleteCheck = new()
@@ -35,8 +47,8 @@ internal sealed class MainForm : Form
         Text = "Delete from iPhone after verified copy (MOVE)", Checked = true, AutoSize = true,
         Padding = new Padding(0, 4, 0, 0),
     };
-    private readonly Button moveButton = new() { Text = "Move checked files  →", AutoSize = true, Font = new Font(SystemFonts.MessageBoxFont!, FontStyle.Bold) };
-    private readonly Button cancelButton = new() { Text = "Cancel", AutoSize = true, Enabled = false };
+    private readonly Button moveButton = new() { Text = "Move checked  →", AutoSize = true, Font = new Font(SystemFonts.MessageBoxFont!, FontStyle.Bold) };
+    private readonly Button cancelButton = new() { Text = "Stop", AutoSize = true, Enabled = false };
     private readonly ProgressBar progressBar = new() { Width = 260, Height = 22, Maximum = 1000 };
     private readonly Label statusLabel = new() { AutoSize = true, Padding = new Padding(0, 6, 0, 0) };
     private readonly TextBox logBox = new()
@@ -44,22 +56,31 @@ internal sealed class MainForm : Form
         Dock = DockStyle.Fill, Multiline = true, ReadOnly = true, ScrollBars = ScrollBars.Vertical,
         Font = new Font(FontFamily.GenericMonospace, 8.5f),
     };
-    private readonly System.Windows.Forms.Timer progressTimer = new() { Interval = 250 };
+    private readonly System.Windows.Forms.Timer progressTimer = new() { Interval = 500 };
+    private readonly System.Windows.Forms.Timer countTimer = new() { Interval = 150 };
 
+    // phone data
     private WpdDevice? device;
     private List<DeviceFile> phoneFiles = [];
-    private readonly Dictionary<string, ListViewItem> phoneItems = [];           // rows shown now
-    private readonly HashSet<string> checkedIds = [];                              // checked files, in all folders
-    private readonly Dictionary<string, (string Text, Color Color)> statusById = []; // survives folder switches
-    private readonly System.Windows.Forms.Timer countTimer = new() { Interval = 150 };
+    private readonly HashSet<string> movedIds = [];                                // deleted from the phone during this session
+    private readonly Dictionary<string, FolderStat> folderStats = new(StringComparer.Ordinal);
+    private readonly Dictionary<string, ListViewItem> folderItems = new(StringComparer.Ordinal);
+    private readonly HashSet<string> checkedFolders = new(StringComparer.Ordinal);  // folder view
+    private readonly Dictionary<string, ListViewItem> phoneItems = [];               // file rows shown now
+    private readonly HashSet<string> checkedIds = [];                                // file view, in all folders
+    private readonly Dictionary<string, (string Text, Color Color)> statusById = [];
     private bool countDirty;
-    private bool fillingList;
-    private bool fillingFolders;
-    private CancellationTokenSource? cts;
-    private long progressBytes, progressTotal;
-    private DateTime progressStart;
+    private bool filling;          // ignore ItemChecked / SelectedIndexChanged while the code fills lists
     private int sortColumn = 1;
     private bool sortAscending = true;
+
+    // move progress
+    private CancellationTokenSource? cts;
+    private long progressBytes, progressTotal;
+    private int filesDone, filesTotal;
+    private DateTime progressStart;
+
+    private bool FolderView => folderViewRadio.Checked;
 
     public MainForm()
     {
@@ -68,11 +89,19 @@ internal sealed class MainForm : Form
         Height = 800;
         StartPosition = FormStartPosition.CenterScreen;
         Font = SystemFonts.MessageBoxFont!;
+        try { Icon = Icon.ExtractAssociatedIcon(Application.ExecutablePath); } catch (Exception) { }
 
         BuildLayout();
+        BuildPcMenu();
         WireEvents();
         LoadDrives();
-        NavigateTo(Settings.LastFolder ?? Environment.GetFolderPath(Environment.SpecialFolder.MyPictures));
+        NavigateTo(StartFolder(), showErrors: false);
+
+        filling = true;
+        folderViewRadio.Checked = Settings.Current.FolderView;
+        fileViewRadio.Checked = !Settings.Current.FolderView;
+        filling = false;
+        ApplyViewMode();
         SetBusy(false);
     }
 
@@ -84,11 +113,32 @@ internal sealed class MainForm : Form
         top.Controls.AddRange([new Label { Text = "iPhone:", AutoSize = true, Padding = new Padding(0, 6, 0, 0) },
             deviceCombo, findDevicesButton, loadFilesButton]);
 
+        folderList.Columns.Add("Folder", 140);
+        folderList.Columns.Add("Files", 70, HorizontalAlignment.Right);
+        folderList.Columns.Add("Size", 90, HorizontalAlignment.Right);
+        folderList.Columns.Add("From", 90);
+        folderList.Columns.Add("To", 90);
+        folderList.Columns.Add("Status", 260);
+
         phoneList.Columns.Add("Name", 170);
         phoneList.Columns.Add("Folder", 110);
         phoneList.Columns.Add("Size", 90, HorizontalAlignment.Right);
         phoneList.Columns.Add("Date", 130);
         phoneList.Columns.Add("Status", 330);
+
+        // View: [Folders] [Files]  (files view: folder filter with ◀ ▶)
+        var prevFolder = new Button { Text = "◀", Width = 32, Height = folderCombo.Height + 2 };
+        var nextFolder = new Button { Text = "▶", Width = 32, Height = folderCombo.Height + 2 };
+        prevFolder.Click += (_, _) => { if (folderCombo.SelectedIndex > 0) folderCombo.SelectedIndex--; };
+        nextFolder.Click += (_, _) => { if (folderCombo.SelectedIndex < folderCombo.Items.Count - 1) folderCombo.SelectedIndex++; };
+        var filterFlow = new FlowLayoutPanel { AutoSize = true, WrapContents = false, Margin = Padding.Empty };
+        filterFlow.Controls.AddRange([new Label { Text = "Folder:", AutoSize = true, Padding = new Padding(12, 6, 0, 0) },
+            folderCombo, prevFolder, nextFolder]);
+        fileFilterPanel.Controls.Add(filterFlow);
+
+        var viewRow = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, WrapContents = false };
+        viewRow.Controls.AddRange([new Label { Text = "Show:", AutoSize = true, Padding = new Padding(0, 6, 0, 0) },
+            folderViewRadio, fileViewRadio, fileFilterPanel]);
 
         var phoneTools = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, WrapContents = false };
         var selectAll = new Button { Text = "Check all shown", AutoSize = true };
@@ -99,31 +149,24 @@ internal sealed class MainForm : Form
         checkSelected.Click += (_, _) => CheckSelectedRows();
         phoneTools.Controls.AddRange([selectAll, selectNone, checkSelected, phoneCountLabel]);
 
-        // Chunk by chunk: show one phone folder at a time (iOS makes one folder per month, e.g. 202606__).
-        var folderRow = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, WrapContents = false };
-        var prevFolder = new Button { Text = "◀", Width = 32, Height = folderCombo.Height + 2 };
-        var nextFolder = new Button { Text = "▶", Width = 32, Height = folderCombo.Height + 2 };
-        prevFolder.Click += (_, _) => { if (folderCombo.SelectedIndex > 0) folderCombo.SelectedIndex--; };
-        nextFolder.Click += (_, _) => { if (folderCombo.SelectedIndex < folderCombo.Items.Count - 1) folderCombo.SelectedIndex++; };
-        folderRow.Controls.AddRange([new Label { Text = "Folder:", AutoSize = true, Padding = new Padding(0, 6, 0, 0) },
-            folderCombo, prevFolder, nextFolder]);
-
         var left = new Panel { Dock = DockStyle.Fill };
+        left.Controls.Add(folderList);
         left.Controls.Add(phoneList);
         left.Controls.Add(phoneTools);
-        left.Controls.Add(folderRow);
+        left.Controls.Add(viewRow);
         left.Controls.Add(Header("On the iPhone"));
 
         pcList.Columns.Add("Name", 260);
         pcList.Columns.Add("Size", 90, HorizontalAlignment.Right);
         pcList.Columns.Add("Modified", 130);
+        pcList.ContextMenuStrip = pcMenu;
 
         var upButton = new Button { Text = "Up", AutoSize = true };
         var newFolderButton = new Button { Text = "New folder", AutoSize = true };
         var refreshButton = new Button { Text = "Refresh", AutoSize = true };
         upButton.Click += (_, _) => NavigateUp();
         newFolderButton.Click += (_, _) => CreateFolder();
-        refreshButton.Click += (_, _) => NavigateTo(pathBox.Text);
+        refreshButton.Click += (_, _) => { LoadDrives(); NavigateTo(pathBox.Text); };
         var pcTools = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, WrapContents = false };
         pcTools.Controls.AddRange([driveCombo, upButton, newFolderButton, refreshButton]);
 
@@ -137,7 +180,7 @@ internal sealed class MainForm : Form
         right.Controls.Add(pcList);
         right.Controls.Add(pathRow);
         right.Controls.Add(pcTools);
-        right.Controls.Add(Header("On this PC (files go into the Destination folder)"));
+        right.Controls.Add(Header("On this PC (each phone folder goes into the Destination folder)"));
 
         var split = new SplitContainer { Dock = DockStyle.Fill, SplitterWidth = 6 };
         split.Panel1.Controls.Add(left);
@@ -165,38 +208,61 @@ internal sealed class MainForm : Form
 
     private void WireEvents()
     {
-        findDevicesButton.Click += async (_, _) => await FindDevicesAsync();
+        findDevicesButton.Click += async (_, _) => await FindDevicesAsync(autoLoad: false);
         loadFilesButton.Click += async (_, _) => await LoadPhoneFilesAsync();
         moveButton.Click += async (_, _) => await MoveAsync();
         cancelButton.Click += (_, _) => cts?.Cancel();
-        phoneList.ItemChecked += OnItemChecked;
-        folderCombo.SelectedIndexChanged += (_, _) => { if (!fillingFolders) FillPhoneList(); };
+        deviceCombo.SelectionChangeCommitted += (_, _) => RememberDevice();
+
+        folderViewRadio.CheckedChanged += (_, _) => { if (!filling) ApplyViewMode(); };
+        folderList.ItemChecked += OnFolderChecked;
+        folderList.DoubleClick += (_, _) => OpenFolderInFileView();
+        phoneList.ItemChecked += OnFileChecked;
+        phoneList.ColumnClick += (_, e) => SortPhoneList(e.Column);
+        folderCombo.SelectedIndexChanged += (_, _) =>
+        {
+            if (filling) return;
+            Settings.Current.PhoneFolder = (folderCombo.SelectedItem as FolderFilter)?.Folder;
+            FillFileList();
+        };
         countTimer.Tick += (_, _) => { if (countDirty) UpdateCount(); };
         countTimer.Start();
-        phoneList.ColumnClick += (_, e) => SortPhoneList(e.Column);
+
         driveCombo.SelectionChangeCommitted += (_, _) => { if (driveCombo.SelectedItem is DriveItem d) NavigateTo(d.Root); };
         pathBox.KeyDown += (_, e) => { if (e.KeyCode == Keys.Enter) { NavigateTo(pathBox.Text); e.SuppressKeyPress = true; } };
-        pcList.DoubleClick += (_, _) => { if (pcList.SelectedItems.Count == 1 && pcList.SelectedItems[0].Tag is string dir) NavigateTo(dir); };
+        pcList.DoubleClick += (_, _) => OpenPcSelection();
+        pcList.KeyDown += OnPcKeyDown;
+
         progressTimer.Tick += (_, _) => UpdateProgress();
-        Load += async (_, _) => await FindDevicesAsync();
+        Load += async (_, _) => await FindDevicesAsync(autoLoad: true);
         FormClosing += OnFormClosing;
     }
 
-    // ================================================================== phone side
+    // ================================================================== devices
 
-    private async Task FindDevicesAsync()
+    private async Task FindDevicesAsync(bool autoLoad)
     {
         SetBusy(true, "Looking for devices...");
+        DeviceInfo? pick = null;
+        bool known = false;
         try
         {
             var devices = await Task.Run(WpdDevice.ListDevices);
             deviceCombo.Items.Clear();
             foreach (var d in devices.OrderByDescending(d => d.LooksLikeApple))
                 deviceCombo.Items.Add(d);
-            if (deviceCombo.Items.Count > 0)
-                deviceCombo.SelectedIndex = 0;
+
+            // Remembered device first (by id, then by name), else the first Apple device, else the first one.
+            var s = Settings.Current;
+            pick = devices.FirstOrDefault(d => d.Id == s.DeviceId)
+                   ?? devices.FirstOrDefault(d => s.DeviceName is not null && d.FriendlyName == s.DeviceName);
+            known = pick is not null;
+            pick ??= devices.FirstOrDefault(d => d.LooksLikeApple) ?? devices.FirstOrDefault();
+            if (pick is not null)
+                deviceCombo.SelectedItem = pick;
+
             Log(devices.Count == 0
-                ? "No portable device found. Connect the iPhone with USB, unlock it and tap \"Trust\"."
+                ? "No portable device found. Connect the iPhone with USB, unlock it and tap \"Trust\". Then click \"Find devices\"."
                 : $"Found {devices.Count} device(s): " + string.Join(", ", devices));
         }
         catch (Exception ex)
@@ -206,6 +272,18 @@ internal sealed class MainForm : Form
         finally
         {
             SetBusy(false);
+        }
+
+        if (autoLoad && pick is not null && (known || pick.LooksLikeApple))
+            await LoadPhoneFilesAsync();
+    }
+
+    private void RememberDevice()
+    {
+        if (deviceCombo.SelectedItem is DeviceInfo d)
+        {
+            Settings.Current.DeviceId = d.Id;
+            Settings.Current.DeviceName = d.FriendlyName;
         }
     }
 
@@ -227,24 +305,26 @@ internal sealed class MainForm : Form
                 device = null;
                 device = await Task.Run(() => WpdDevice.Open(info));
             }
+            RememberDevice();
 
             var progress = new Progress<string>(folder => statusLabel.Text = "Reading " + folder);
             var dev = device;
             var token = cts.Token;
-            var sw = System.Diagnostics.Stopwatch.StartNew();
+            var sw = Stopwatch.StartNew();
             phoneFiles = await Task.Run(() => dev.ListFiles(progress, token));
+            movedIds.Clear();
             checkedIds.Clear();
+            checkedFolders.Clear();
             statusById.Clear();
-            FillFolderCombo();
+            RebuildPhoneViews(restoreFilter: Settings.Current.PhoneFolder);
             Log($"Phone has {phoneFiles.Count:N0} files, {FormatSize(phoneFiles.Sum(f => Math.Max(0, f.Size)))}, " +
-                $"in {folderCombo.Items.Count - 1} folders (read in {sw.Elapsed.TotalSeconds:0.0} s). " +
-                "Pick a folder to work chunk by chunk.");
+                $"in {folderStats.Count} folders (read in {sw.Elapsed.TotalSeconds:0.0} s).");
             if (phoneFiles.Count == 0)
-                Log("No files. Unlock the iPhone, tap \"Trust\", then click \"Load files\" again.");
+                Log("No files. Unlock the iPhone, tap \"Trust\", then click \"Reload files from phone\".");
         }
         catch (OperationCanceledException)
         {
-            Log("Reading the file list was cancelled.");
+            Log("Reading the file list was stopped.");
         }
         catch (Exception ex)
         {
@@ -258,54 +338,130 @@ internal sealed class MainForm : Form
         }
     }
 
-    private sealed record FolderItem(string? Folder, int Count, long Bytes)
+    // ================================================================== phone views
+
+    private sealed class FolderStat(string folder)
     {
-        public override string ToString() =>
-            $"{Folder ?? "All folders"}   ({Count:N0} files, {FormatSize(Bytes)})";
+        public string Folder { get; } = folder;
+        public int Count;
+        public long Bytes;
+        public DateTime? First, Last;
+        public int Failed;
     }
 
-    /// <summary>
-    /// Fills the folder filter and keeps the current folder selected when it still exists.
-    /// With <paramref name="refillList"/> = false the rows stay as they are (to keep the results of a move visible).
-    /// </summary>
-    private void FillFolderCombo(bool refillList = true)
+    private sealed record FolderFilter(string? Folder, int Count, long Bytes)
     {
-        string? current = (folderCombo.SelectedItem as FolderItem)?.Folder;
-        bool wasAll = folderCombo.SelectedItem is FolderItem { Folder: null };
+        public override string ToString() => $"{Folder ?? "All folders"}   ({Count:N0} files, {FormatSize(Bytes)})";
+    }
 
-        fillingFolders = true;
+    /// <summary>Removes moved files, then rebuilds folder stats, the folder list, the folder filter and the file list.</summary>
+    private void RebuildPhoneViews(string? restoreFilter)
+    {
+        if (movedIds.Count > 0)
+        {
+            phoneFiles.RemoveAll(f => movedIds.Contains(f.ObjectId));
+            movedIds.Clear();
+        }
+
+        folderStats.Clear();
+        foreach (var f in phoneFiles)
+        {
+            if (!folderStats.TryGetValue(f.Folder, out var st))
+                folderStats[f.Folder] = st = new FolderStat(f.Folder);
+            st.Count++;
+            st.Bytes += Math.Max(0, f.Size);
+            var d = f.Created ?? f.Modified;
+            if (d is not null)
+            {
+                if (st.First is null || d < st.First) st.First = d;
+                if (st.Last is null || d > st.Last) st.Last = d;
+            }
+        }
+        // Folders without files are not shown (they come only from files).
+        checkedFolders.IntersectWith(folderStats.Keys);
+
+        FillFolderList();
+        FillFolderFilter(restoreFilter);
+        FillFileList();
+    }
+
+    private void FillFolderList()
+    {
+        var items = folderStats.Values
+            .OrderBy(s => s.Folder, StringComparer.OrdinalIgnoreCase)
+            .Select(s =>
+            {
+                var item = new ListViewItem([
+                    FolderLabel(s.Folder), "", "",
+                    s.First?.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) ?? "",
+                    s.Last?.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture) ?? "",
+                    "",
+                ]) { Tag = s.Folder, Checked = checkedFolders.Contains(s.Folder) };
+                SetFolderRowCounts(item, s);
+                return item;
+            })
+            .ToArray();
+
+        folderItems.Clear();
+        foreach (var i in items)
+            folderItems[(string)i.Tag!] = i;
+
+        filling = true;
+        folderList.BeginUpdate();
+        try
+        {
+            folderList.Items.Clear();
+            folderList.Items.AddRange(items);
+        }
+        finally
+        {
+            folderList.EndUpdate();
+            filling = false;
+        }
+        countDirty = true;
+    }
+
+    private static string FolderLabel(string folder)
+    {
+        string last = folder.Split('\\').LastOrDefault() ?? folder;
+        return last.Length == 0 ? "(root)" : last;
+    }
+
+    private static void SetFolderRowCounts(ListViewItem item, FolderStat s)
+    {
+        item.SubItems[1].Text = s.Count.ToString("N0", CultureInfo.CurrentCulture);
+        item.SubItems[2].Text = FormatSize(s.Bytes);
+    }
+
+    private void FillFolderFilter(string? restore)
+    {
+        filling = true;
         try
         {
             folderCombo.BeginUpdate();
             folderCombo.Items.Clear();
-            folderCombo.Items.Add(new FolderItem(null, phoneFiles.Count, phoneFiles.Sum(f => Math.Max(0, f.Size))));
-            foreach (var g in phoneFiles.GroupBy(f => f.Folder).OrderBy(g => g.Key, StringComparer.OrdinalIgnoreCase))
-                folderCombo.Items.Add(new FolderItem(g.Key, g.Count(), g.Sum(f => Math.Max(0, f.Size))));
+            folderCombo.Items.Add(new FolderFilter(null, phoneFiles.Count, folderStats.Values.Sum(s => s.Bytes)));
+            foreach (var s in folderStats.Values.OrderBy(s => s.Folder, StringComparer.OrdinalIgnoreCase))
+                folderCombo.Items.Add(new FolderFilter(s.Folder, s.Count, s.Bytes));
             folderCombo.EndUpdate();
 
-            int index = wasAll ? 0 : -1;
-            for (int i = 1; i < folderCombo.Items.Count && index < 0; i++)
-                if (((FolderItem)folderCombo.Items[i]!).Folder == current)
-                    index = i;
-            if (index < 0)
-            {
-                index = folderCombo.Items.Count > 1 ? 1 : 0; // start with the first (oldest) folder
-                refillList = true;
-            }
+            int index = 0;
+            if (restore is not null)
+                for (int i = 1; i < folderCombo.Items.Count; i++)
+                    if (((FolderFilter)folderCombo.Items[i]!).Folder == restore)
+                        index = i;
             folderCombo.SelectedIndex = index;
         }
         finally
         {
-            fillingFolders = false;
+            filling = false;
         }
-        if (refillList)
-            FillPhoneList();
     }
 
-    /// <summary>Shows the files of the selected folder (or all files).</summary>
-    private void FillPhoneList()
+    /// <summary>File view: shows the files of the selected folder (or all files).</summary>
+    private void FillFileList()
     {
-        string? folder = (folderCombo.SelectedItem as FolderItem)?.Folder;
+        string? folder = (folderCombo.SelectedItem as FolderFilter)?.Folder;
         var shown = folder is null ? phoneFiles : phoneFiles.Where(f => f.Folder == folder).ToList();
 
         var items = new ListViewItem[shown.Count];
@@ -315,7 +471,7 @@ internal sealed class MainForm : Form
             var f = shown[i];
             var item = new ListViewItem([
                 f.Name,
-                f.Folder,
+                FolderLabel(f.Folder),
                 f.Size < 0 ? "?" : FormatSize(f.Size),
                 (f.Created ?? f.Modified)?.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture) ?? "",
                 f.CanDelete ? "" : "read-only on phone",
@@ -330,7 +486,7 @@ internal sealed class MainForm : Form
         }
 
         // ItemChecked fires for every added row; ignore those events while filling.
-        fillingList = true;
+        filling = true;
         phoneList.BeginUpdate();
         try
         {
@@ -342,79 +498,119 @@ internal sealed class MainForm : Form
         finally
         {
             phoneList.EndUpdate();
-            fillingList = false;
+            filling = false;
         }
-        UpdateCount();
-    }
-
-    private void OnItemChecked(object? sender, ItemCheckedEventArgs e)
-    {
-        if (fillingList)
-            return;
-        var f = (DeviceFile)e.Item.Tag!;
-        if (e.Item.Checked)
-            checkedIds.Add(f.ObjectId);
-        else
-            checkedIds.Remove(f.ObjectId);
         countDirty = true;
     }
 
-    private void SetShownChecked(bool value)
+    private void ApplyViewMode()
     {
-        fillingList = true;
-        phoneList.BeginUpdate();
+        bool folders = FolderView;
+        folderList.Visible = folders;
+        phoneList.Visible = !folders;
+        fileFilterPanel.Visible = !folders;
+        moveButton.Text = folders ? "Move checked folders  →" : "Move checked files  →";
+        Settings.Current.FolderView = folders;
+        UpdateCount();
+    }
+
+    private void OpenFolderInFileView()
+    {
+        if (folderList.SelectedItems.Count != 1)
+            return;
+        string folder = (string)folderList.SelectedItems[0].Tag!;
+        for (int i = 1; i < folderCombo.Items.Count; i++)
+            if (((FolderFilter)folderCombo.Items[i]!).Folder == folder)
+                folderCombo.SelectedIndex = i; // fires FillFileList
+        fileViewRadio.Checked = true;
+    }
+
+    private void OnFolderChecked(object? sender, ItemCheckedEventArgs e)
+    {
+        if (filling)
+            return;
+        string folder = (string)e.Item.Tag!;
+        if (e.Item.Checked) checkedFolders.Add(folder); else checkedFolders.Remove(folder);
+        countDirty = true;
+    }
+
+    private void OnFileChecked(object? sender, ItemCheckedEventArgs e)
+    {
+        if (filling)
+            return;
+        var f = (DeviceFile)e.Item.Tag!;
+        if (e.Item.Checked) checkedIds.Add(f.ObjectId); else checkedIds.Remove(f.ObjectId);
+        countDirty = true;
+    }
+
+    private ListView ActiveList => FolderView ? folderList : phoneList;
+
+    private void SetChecked(ListViewItem item, bool value)
+    {
+        if (item.Tag is string folder)
+        {
+            value &= folderStats.TryGetValue(folder, out var s) && s.Count > 0;
+            if (value) checkedFolders.Add(folder); else checkedFolders.Remove(folder);
+        }
+        else if (item.Tag is DeviceFile f)
+        {
+            value &= !movedIds.Contains(f.ObjectId);
+            if (value) checkedIds.Add(f.ObjectId); else checkedIds.Remove(f.ObjectId);
+        }
+        item.Checked = value;
+    }
+
+    private void ForEachRow(IEnumerable rows, Action<ListViewItem> action)
+    {
+        var list = ActiveList;
+        filling = true;
+        list.BeginUpdate();
         try
         {
-            foreach (ListViewItem i in phoneList.Items)
-            {
-                var f = (DeviceFile)i.Tag!;
-                bool v = value && phoneFiles.Count > 0 && i.ForeColor != SystemColors.GrayText;
-                i.Checked = v;
-                if (v) checkedIds.Add(f.ObjectId); else checkedIds.Remove(f.ObjectId);
-            }
+            foreach (ListViewItem i in rows)
+                action(i);
         }
         finally
         {
-            phoneList.EndUpdate();
-            fillingList = false;
+            list.EndUpdate();
+            filling = false;
         }
         UpdateCount();
     }
+
+    private void SetShownChecked(bool value) => ForEachRow(ActiveList.Items, i => SetChecked(i, value));
+
+    private void CheckSelectedRows() => ForEachRow(ActiveList.SelectedItems, i => SetChecked(i, true));
 
     private void UncheckAll()
     {
         checkedIds.Clear();
-        SetShownChecked(false);
+        checkedFolders.Clear();
+        ForEachRow(folderList.Items, i => i.Checked = false);
+        ForEachRow(phoneList.Items, i => i.Checked = false);
     }
 
-    private void CheckSelectedRows()
+    /// <summary>The files to move, in folder order then name order.</summary>
+    private List<DeviceFile> FilesToMove()
     {
-        fillingList = true;
-        phoneList.BeginUpdate();
-        try
-        {
-            foreach (ListViewItem i in phoneList.SelectedItems)
-            {
-                i.Checked = true;
-                checkedIds.Add(((DeviceFile)i.Tag!).ObjectId);
-            }
-        }
-        finally
-        {
-            phoneList.EndUpdate();
-            fillingList = false;
-        }
-        UpdateCount();
+        var files = FolderView
+            ? phoneFiles.Where(f => checkedFolders.Contains(f.Folder))
+            : phoneFiles.Where(f => checkedIds.Contains(f.ObjectId));
+        return files
+            .Where(f => !movedIds.Contains(f.ObjectId))
+            .OrderBy(f => f.Folder, StringComparer.OrdinalIgnoreCase)
+            .ThenBy(f => f.Name, StringComparer.OrdinalIgnoreCase)
+            .ToList();
     }
-
-    private List<DeviceFile> CheckedFiles() => phoneFiles.Where(f => checkedIds.Contains(f.ObjectId)).ToList();
 
     private void UpdateCount()
     {
         countDirty = false;
-        var files = CheckedFiles();
+        var files = FilesToMove();
         long bytes = files.Sum(f => Math.Max(0, f.Size));
-        phoneCountLabel.Text = $"{files.Count:N0} checked in total ({FormatSize(bytes)}) — {phoneList.Items.Count:N0} shown";
+        phoneCountLabel.Text = FolderView
+            ? $"{checkedFolders.Count:N0} of {folderStats.Count:N0} folders checked ({files.Count:N0} files, {FormatSize(bytes)})"
+            : $"{files.Count:N0} files checked in total ({FormatSize(bytes)}) — {phoneList.Items.Count:N0} shown";
     }
 
     private void SortPhoneList(int column)
@@ -450,8 +646,11 @@ internal sealed class MainForm : Form
         public override string ToString() => Label;
     }
 
+    private sealed record PcEntry(string Path, bool IsDirectory, bool IsParent);
+
     private void LoadDrives()
     {
+        object? selected = driveCombo.SelectedItem;
         driveCombo.Items.Clear();
         foreach (var d in DriveInfo.GetDrives())
         {
@@ -460,39 +659,66 @@ internal sealed class MainForm : Form
             string label = $"{d.Name.TrimEnd('\\')} {d.VolumeLabel} ({FormatSize(d.AvailableFreeSpace)} free)";
             driveCombo.Items.Add(new DriveItem(d.RootDirectory.FullName, label));
         }
+        if (selected is DriveItem s)
+            driveCombo.SelectedItem = driveCombo.Items.Cast<DriveItem>().FirstOrDefault(d => d.Root == s.Root);
     }
 
-    private void NavigateTo(string path)
+    /// <summary>The remembered folder, or its nearest existing parent, or the first drive.</summary>
+    private string StartFolder()
+    {
+        string? path = Settings.Current.PcFolder;
+        try
+        {
+            while (!string.IsNullOrEmpty(path) && !Directory.Exists(path))
+                path = Path.GetDirectoryName(path);
+        }
+        catch (ArgumentException)
+        {
+            path = null;
+        }
+        if (!string.IsNullOrEmpty(path))
+            return path;
+        return driveCombo.Items.Count > 0
+            ? ((DriveItem)driveCombo.Items[0]!).Root
+            : Environment.GetFolderPath(Environment.SpecialFolder.MyPictures);
+    }
+
+    private void NavigateTo(string path, bool showErrors = true)
     {
         try
         {
             path = Path.GetFullPath(path.Trim());
             if (!Directory.Exists(path))
             {
-                MessageBox.Show(this, $"Folder not found:\n{path}", Text);
+                if (showErrors)
+                    MessageBox.Show(this, $"Folder not found:\n{path}", Text);
                 return;
             }
             var dir = new DirectoryInfo(path);
+            var items = new List<ListViewItem>();
+            if (dir.Parent is not null)
+                items.Add(new ListViewItem(["..", "", ""]) { Tag = new PcEntry(dir.Parent.FullName, true, true) });
+            foreach (var sub in dir.EnumerateDirectories().Where(d => (d.Attributes & FileAttributes.Hidden) == 0).OrderBy(d => d.Name))
+                items.Add(new ListViewItem(["📁 " + sub.Name, "", sub.LastWriteTime.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture)])
+                    { Tag = new PcEntry(sub.FullName, true, false) });
+            foreach (var file in dir.EnumerateFiles().OrderBy(f => f.Name).Take(5000))
+                items.Add(new ListViewItem([file.Name, FormatSize(file.Length), file.LastWriteTime.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture)])
+                    { Tag = new PcEntry(file.FullName, false, false) });
 
             pcList.BeginUpdate();
             pcList.Items.Clear();
-            if (dir.Parent is not null)
-                pcList.Items.Add(new ListViewItem(["..", "", ""]) { Tag = dir.Parent.FullName });
-            foreach (var sub in dir.EnumerateDirectories().Where(d => (d.Attributes & FileAttributes.Hidden) == 0).OrderBy(d => d.Name))
-                pcList.Items.Add(new ListViewItem(["📁 " + sub.Name, "", sub.LastWriteTime.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture)]) { Tag = sub.FullName });
-            foreach (var file in dir.EnumerateFiles().OrderBy(f => f.Name).Take(5000))
-                pcList.Items.Add(new ListViewItem([file.Name, FormatSize(file.Length), file.LastWriteTime.ToString("yyyy-MM-dd HH:mm", CultureInfo.InvariantCulture)]));
+            pcList.Items.AddRange(items.ToArray());
             pcList.EndUpdate();
 
             pathBox.Text = path;
-            Settings.LastFolder = path;
+            Settings.Current.PcFolder = path;
             string root = Path.GetPathRoot(path) ?? "";
             driveCombo.SelectedItem = driveCombo.Items.Cast<DriveItem>().FirstOrDefault(d => string.Equals(d.Root, root, StringComparison.OrdinalIgnoreCase));
         }
         catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException or NotSupportedException)
         {
-            pcList.EndUpdate();
-            MessageBox.Show(this, $"Cannot open folder:\n{ex.Message}", Text);
+            if (showErrors)
+                MessageBox.Show(this, $"Cannot open folder:\n{ex.Message}", Text);
         }
     }
 
@@ -501,6 +727,88 @@ internal sealed class MainForm : Form
         var parent = Directory.GetParent(pathBox.Text.TrimEnd('\\'));
         if (parent is not null)
             NavigateTo(parent.FullName);
+    }
+
+    private List<PcEntry> SelectedPcEntries() =>
+        pcList.SelectedItems.Cast<ListViewItem>().Select(i => (PcEntry)i.Tag!).Where(e => !e.IsParent).ToList();
+
+    private void BuildPcMenu()
+    {
+        var open = new ToolStripMenuItem("Open", null, (_, _) => OpenPcSelection());
+        var explorer = new ToolStripMenuItem("Show in Explorer", null, (_, _) => ShowInExplorer());
+        var newFolder = new ToolStripMenuItem("New folder", null, (_, _) => CreateFolder());
+        var rename = new ToolStripMenuItem("Rename", null, (_, _) => RenamePcEntry()) { ShortcutKeyDisplayString = "F2" };
+        var recycle = new ToolStripMenuItem("Delete (to Recycle Bin)", null, (_, _) => DeletePcEntries(permanent: false)) { ShortcutKeyDisplayString = "Del" };
+        var delete = new ToolStripMenuItem("Delete permanently", null, (_, _) => DeletePcEntries(permanent: true)) { ShortcutKeyDisplayString = "Shift+Del" };
+        var refresh = new ToolStripMenuItem("Refresh", null, (_, _) => NavigateTo(pathBox.Text)) { ShortcutKeyDisplayString = "F5" };
+        pcMenu.Items.AddRange([open, explorer, new ToolStripSeparator(), newFolder, rename, new ToolStripSeparator(),
+            recycle, delete, new ToolStripSeparator(), refresh]);
+
+        pcMenu.Opening += (_, _) =>
+        {
+            var sel = SelectedPcEntries();
+            bool busy = cts is not null;
+            open.Enabled = pcList.SelectedItems.Count == 1;
+            rename.Enabled = sel.Count == 1 && !busy;
+            recycle.Enabled = delete.Enabled = sel.Count > 0 && !busy;
+        };
+    }
+
+    private void OnPcKeyDown(object? sender, KeyEventArgs e)
+    {
+        bool busy = cts is not null;
+        switch (e.KeyCode)
+        {
+            case Keys.Delete when !busy:
+                DeletePcEntries(permanent: e.Shift);
+                break;
+            case Keys.F2 when !busy:
+                RenamePcEntry();
+                break;
+            case Keys.F5:
+                NavigateTo(pathBox.Text);
+                break;
+            case Keys.Enter:
+                OpenPcSelection();
+                break;
+            case Keys.Back:
+                NavigateUp();
+                break;
+            default:
+                return;
+        }
+        e.Handled = e.SuppressKeyPress = true;
+    }
+
+    private void OpenPcSelection()
+    {
+        if (pcList.SelectedItems.Count != 1 || pcList.SelectedItems[0].Tag is not PcEntry entry)
+            return;
+        if (entry.IsDirectory)
+            NavigateTo(entry.Path);
+        else
+            StartShell(entry.Path, null);
+    }
+
+    private void ShowInExplorer()
+    {
+        var sel = SelectedPcEntries();
+        if (sel.Count > 0)
+            StartShell("explorer.exe", $"/select,\"{sel[0].Path}\"");
+        else
+            StartShell("explorer.exe", $"\"{pathBox.Text}\"");
+    }
+
+    private void StartShell(string file, string? args)
+    {
+        try
+        {
+            Process.Start(new ProcessStartInfo(file, args ?? "") { UseShellExecute = true })?.Dispose();
+        }
+        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or InvalidOperationException)
+        {
+            MessageBox.Show(this, ex.Message, Text);
+        }
     }
 
     private void CreateFolder()
@@ -518,6 +826,68 @@ internal sealed class MainForm : Form
         {
             MessageBox.Show(this, ex.Message, Text);
         }
+    }
+
+    private void RenamePcEntry()
+    {
+        var sel = SelectedPcEntries();
+        if (sel.Count != 1)
+            return;
+        var entry = sel[0];
+        string oldName = Path.GetFileName(entry.Path);
+        string? name = Prompt("New name:", oldName);
+        if (string.IsNullOrWhiteSpace(name) || name == oldName)
+            return;
+        try
+        {
+            string target = Path.Combine(Path.GetDirectoryName(entry.Path)!, MoveEngine.SafeName(name));
+            if (entry.IsDirectory)
+                Directory.Move(entry.Path, target);
+            else
+                File.Move(entry.Path, target);
+            NavigateTo(pathBox.Text);
+        }
+        catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+        {
+            MessageBox.Show(this, ex.Message, Text);
+        }
+    }
+
+    private void DeletePcEntries(bool permanent)
+    {
+        var sel = SelectedPcEntries();
+        if (sel.Count == 0)
+            return;
+        string what = sel.Count == 1 ? $"\"{Path.GetFileName(sel[0].Path)}\"" : $"{sel.Count} items";
+        string question = permanent
+            ? $"Delete {what} PERMANENTLY?\nThis cannot be undone."
+            : $"Move {what} to the Recycle Bin?";
+        if (MessageBox.Show(this, question, Text, MessageBoxButtons.YesNo,
+                permanent ? MessageBoxIcon.Warning : MessageBoxIcon.Question) != DialogResult.Yes)
+            return;
+
+        foreach (var e in sel)
+        {
+            try
+            {
+                if (permanent)
+                {
+                    if (e.IsDirectory) Directory.Delete(e.Path, recursive: true);
+                    else File.Delete(e.Path);
+                }
+                else
+                {
+                    RecycleBin.Send(e.Path);
+                }
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                MessageBox.Show(this, $"Cannot delete {e.Path}:\n{ex.Message}", Text);
+                break;
+            }
+        }
+        LoadDrives();
+        NavigateTo(pathBox.Text);
     }
 
     private string? Prompt(string question, string value)
@@ -545,10 +915,10 @@ internal sealed class MainForm : Form
             MessageBox.Show(this, "Load the files from the phone first.", Text);
             return;
         }
-        var selected = CheckedFiles();
+        var selected = FilesToMove();
         if (selected.Count == 0)
         {
-            MessageBox.Show(this, "Check the files you want to move (left list).", Text);
+            MessageBox.Show(this, FolderView ? "Check the folders you want to move (left list)." : "Check the files you want to move (left list).", Text);
             return;
         }
         string dest = pathBox.Text;
@@ -559,19 +929,22 @@ internal sealed class MainForm : Form
         }
 
         // Files that belong to the same photo (Live Photo video, edited copy, .AAE) are moved together.
-        var groups = AssetGrouping.Expand(selected, phoneFiles);
+        var groups = AssetGrouping.Expand(selected, phoneFiles.Where(f => !movedIds.Contains(f.ObjectId)));
         var all = groups.SelectMany(g => g).ToList();
         int added = all.Count - selected.Count;
         long total = all.Sum(f => Math.Max(0, f.Size));
         bool delete = deleteCheck.Checked;
+        var folders = all.Select(f => f.Folder).Distinct().ToList();
 
-        int folders = all.Select(f => f.Folder).Distinct().Count();
-        string msg = $"{all.Count:N0} files ({FormatSize(total)}) from {folders:N0} phone folder(s) will be copied to:\n{dest}\n\n";
+        string example = Path.Combine(dest, FolderLabel(folders[0]));
+        string msg = $"{all.Count:N0} files ({FormatSize(total)}) from {folders.Count:N0} phone folder(s) will be copied to:\n" +
+                     $"{dest}\n(one PC folder per phone folder, for example {example})\n\n";
         if (added > 0)
             msg += $"{added:N0} related files were added (Live Photo videos, edited versions, .AAE), " +
                    "because iOS keeps them together with the checked photos.\n\n";
         msg += delete
-            ? "After each photo is copied and checked (size + file format), it will be DELETED from the iPhone.\n" +
+            ? "Each photo is copied, checked (size + file format) and then DELETED from the iPhone, one photo at a time.\n" +
+              "You can stop at any time and continue later.\n" +
               "Deleted files may not go to \"Recently Deleted\" on the phone.\n\nContinue?"
             : "Files stay on the iPhone (copy only).\n\nContinue?";
         if (MessageBox.Show(this, msg, Text, MessageBoxButtons.OKCancel,
@@ -581,26 +954,29 @@ internal sealed class MainForm : Form
         cts = new CancellationTokenSource();
         progressBytes = 0;
         progressTotal = Math.Max(1, total);
+        filesDone = 0;
+        filesTotal = all.Count;
         progressStart = DateTime.Now;
         SetBusy(true, "Moving...");
         progressTimer.Start();
-        Log($"--- {(delete ? "MOVE" : "COPY")} {all.Count:N0} files to {dest}");
+        Log($"--- {(delete ? "MOVE" : "COPY")} {all.Count:N0} files from {folders.Count:N0} folder(s) to {dest}");
 
         var report = new Progress<FileReport>(OnFileReport);
-        var engine = new MoveEngine(device, dest, delete, report, n => Interlocked.Exchange(ref progressBytes, n));
+        var engine = new MoveEngine(device, dest, delete, report, n => Interlocked.Exchange(ref progressBytes, n), AskForSpace);
         var token = cts.Token;
+        KeepAwake(true); // a long move must not be stopped by PC sleep
         try
         {
             var summary = await Task.Run(() => engine.Run(groups, token));
             Log($"Done. Moved: {summary.Moved:N0}, copied only: {summary.CopiedOnly:N0}, failed: {summary.Failed:N0}. " +
-                $"Log file: {Path.Combine(dest, MoveEngine.LogFileName)}");
+                $"A log file ({MoveEngine.LogFileName}) is in each PC folder.");
             if (summary.Failed > 0)
                 MessageBox.Show(this, $"{summary.Failed:N0} file(s) failed. They are still on the phone.\nSee the Status column and the log.",
                     Text, MessageBoxButtons.OK, MessageBoxIcon.Warning);
         }
         catch (OperationCanceledException)
         {
-            Log("Cancelled. Files that were not finished are still on the phone.");
+            Log("Stopped. Files that were not finished are still on the phone. Click Move again to continue.");
         }
         catch (Exception ex)
         {
@@ -609,11 +985,15 @@ internal sealed class MainForm : Form
         }
         finally
         {
+            KeepAwake(false);
             progressTimer.Stop();
             UpdateProgress();
             SetBusy(false);
+            LoadDrives();
             NavigateTo(pathBox.Text);
-            FillFolderCombo(refillList: false); // new file counts; keep the result rows visible
+            // Hide emptied folders and moved files. In file view the result rows stay until the next refresh.
+            if (FolderView)
+                RebuildPhoneViews((folderCombo.SelectedItem as FolderFilter)?.Folder);
             UpdateCount();
         }
     }
@@ -635,27 +1015,75 @@ internal sealed class MainForm : Form
             _ => SystemColors.WindowText,
         };
         statusById[r.File.ObjectId] = (text, color);
+        if (r.State != FileState.Copying)
+            filesDone++;
 
         if (r.State == FileState.Moved)
         {
-            phoneFiles.Remove(r.File); // gone from the phone
+            movedIds.Add(r.File.ObjectId); // gone from the phone
             checkedIds.Remove(r.File.ObjectId);
             countDirty = true;
         }
         if (r.State == FileState.Failed)
             Log($"{r.File.DevicePath}: {r.Detail}");
 
+        UpdateFolderRow(r);
+
         if (!phoneItems.TryGetValue(r.File.ObjectId, out var item))
             return;
         item.SubItems[4].Text = text;
         item.ForeColor = color;
-        if (r.State == FileState.Copying)
+        if (r.State == FileState.Copying && phoneList.Visible)
             item.EnsureVisible();
         if (r.State == FileState.Moved)
         {
-            fillingList = true;
+            filling = true;
             item.Checked = false;
-            fillingList = false;
+            filling = false;
+        }
+    }
+
+    /// <summary>Called from the move thread when the disk is almost full. Blocks until the user answers.</summary>
+    private bool AskForSpace(string message) => (bool)Invoke(() =>
+    {
+        Log("Paused: low disk space.");
+        statusLabel.Text = "PAUSED — low disk space";
+        var answer = MessageBox.Show(this, message, Text + " — paused", MessageBoxButtons.RetryCancel, MessageBoxIcon.Warning);
+        LoadDrives();
+        if (answer == DialogResult.Retry)
+            Log("Continue after low disk space.");
+        return answer == DialogResult.Retry;
+    });
+
+    private void UpdateFolderRow(FileReport r)
+    {
+        if (!folderStats.TryGetValue(r.File.Folder, out var st) || !folderItems.TryGetValue(r.File.Folder, out var row))
+            return;
+        if (r.State == FileState.Moved)
+        {
+            st.Count--;
+            st.Bytes -= Math.Max(0, r.File.Size);
+            SetFolderRowCounts(row, st);
+        }
+        if (r.State == FileState.Failed)
+            st.Failed++;
+
+        string failed = st.Failed > 0 ? $", {st.Failed} failed" : "";
+        if (st.Count == 0)
+        {
+            row.SubItems[5].Text = "✔ all moved";
+            row.ForeColor = SystemColors.GrayText;
+            filling = true;
+            row.Checked = false;
+            filling = false;
+            checkedFolders.Remove(st.Folder);
+        }
+        else
+        {
+            row.SubItems[5].Text = r.State == FileState.Copying ? $"moving... {st.Count:N0} left{failed}" : $"{st.Count:N0} left{failed}";
+            row.ForeColor = st.Failed > 0 ? Color.Firebrick : SystemColors.WindowText;
+            if (r.State == FileState.Copying && folderList.Visible)
+                row.EnsureVisible();
         }
     }
 
@@ -664,10 +1092,25 @@ internal sealed class MainForm : Form
         long done = Interlocked.Read(ref progressBytes);
         progressBar.Value = (int)Math.Clamp(done * 1000 / Math.Max(1, progressTotal), 0, 1000);
         double secs = Math.Max(0.1, (DateTime.Now - progressStart).TotalSeconds);
-        statusLabel.Text = $"{FormatSize(done)} of {FormatSize(progressTotal)} — {FormatSize((long)(done / secs))}/s";
+        double speed = done / secs;
+        string eta = speed > 1 && done > 0
+            ? TimeSpan.FromSeconds((progressTotal - done) / speed).ToString(@"h\:mm\:ss", CultureInfo.InvariantCulture)
+            : "?";
+        statusLabel.Text = $"{filesDone:N0} / {filesTotal:N0} files — {FormatSize(done)} of {FormatSize(progressTotal)} — " +
+                           $"{FormatSize((long)speed)}/s — left: {eta}";
     }
 
     // ================================================================== misc
+
+    [DllImport("kernel32.dll")]
+    private static extern uint SetThreadExecutionState(uint esFlags);
+
+    /// <summary>Stops Windows from going to sleep while a move runs (the screen may still turn off).</summary>
+    private static void KeepAwake(bool on)
+    {
+        const uint ES_CONTINUOUS = 0x80000000, ES_SYSTEM_REQUIRED = 0x00000001;
+        SetThreadExecutionState(on ? ES_CONTINUOUS | ES_SYSTEM_REQUIRED : ES_CONTINUOUS);
+    }
 
     private void SetBusy(bool busy, string? status = null)
     {
@@ -675,6 +1118,7 @@ internal sealed class MainForm : Form
         loadFilesButton.Enabled = !busy;
         deviceCombo.Enabled = !busy;
         folderCombo.Enabled = !busy;
+        folderViewRadio.Enabled = fileViewRadio.Enabled = !busy;
         moveButton.Enabled = !busy;
         deleteCheck.Enabled = !busy;
         cancelButton.Enabled = busy && cts is not null;
@@ -699,7 +1143,8 @@ internal sealed class MainForm : Form
     {
         if (cts is not null)
         {
-            if (MessageBox.Show(this, "Work is still running. Cancel it and close?", Text, MessageBoxButtons.YesNo) != DialogResult.Yes)
+            if (MessageBox.Show(this, "Work is still running. Stop it and close?\n(You can continue the move next time.)",
+                    Text, MessageBoxButtons.YesNo) != DialogResult.Yes)
             {
                 e.Cancel = true;
                 return;

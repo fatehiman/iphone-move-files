@@ -1,4 +1,4 @@
-<Project Sdk="Microsoft.NET.Sdk">
+﻿<Project Sdk="Microsoft.NET.Sdk">
 
   <PropertyGroup>
     <OutputType>WinExe</OutputType>
@@ -11,8 +11,11 @@
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>false</SelfContained>
     <AssemblyName>IphoneMover</AssemblyName>
-    <Version>1.0.0</Version>
+    <Version>1.1.0</Version>
     <Product>iPhone Mover</Product>
+    <ApplicationIcon>app.ico</ApplicationIcon>
+    <Authors>fatehiman</Authors>
+    <Copyright>Copyright (c) 2026 fatehiman. MIT License.</Copyright>
   </PropertyGroup>
 
   <ItemGroup>

@@ -32,8 +32,12 @@ internal sealed class MoveEngine(
     string destinationRoot,
     bool deleteAfterCopy,
     IProgress<FileReport> report,
-    Action<long> onBytes)
+    Action<long> onBytes,
+    Func<string, bool>? askForSpace = null)
 {
+    /// <summary>Pause when the destination drive has less free space than this.</summary>
+    public const long MinFreeSpace = 1L << 30; // 1 GB
+
     public const string LogFileName = "iphone-mover-log.csv";
 
     private const string KeepOriginalsHint =
@@ -41,83 +45,140 @@ internal sealed class MoveEngine(
     private const string ReadOnlyHint =
         " The phone refused. Possible reasons: iCloud Photos is on, or the photo was synced from a computer (iTunes).";
 
+    /// <summary>Stop the run when this many files fail one after another (phone unplugged, locked, ...).</summary>
+    public const int MaxFailuresInRow = 10;
+
     private long bytesDone;
+    private int failuresInRow;
+    private readonly Dictionary<string, StreamWriter> logs = new(StringComparer.OrdinalIgnoreCase);
 
     public MoveSummary Run(IReadOnlyList<List<DeviceFile>> groups, CancellationToken ct)
     {
         var summary = new MoveSummary();
         Directory.CreateDirectory(destinationRoot);
-        using var log = OpenLog();
-
-        foreach (var group in groups)
+        try
         {
-            ct.ThrowIfCancellationRequested();
-
-            // Step 1-3: copy and check every file of the group.
-            var copied = new List<(DeviceFile File, string PcPath, CheckResult Check)>();
-            bool groupOk = true;
-            foreach (var file in group)
+            foreach (var group in groups)
             {
                 ct.ThrowIfCancellationRequested();
-                report.Report(new FileReport(file, FileState.Copying, "copying...", null));
-                try
-                {
-                    var (pcPath, check, note) = CopyAndCheck(file, ct);
-                    copied.Add((file, pcPath, check));
-                    if (check.Status != CheckStatus.Valid)
-                        groupOk = false;
-                    summary.Bytes += file.Size;
-                    WriteLog(log, file, pcPath, "copied", note + check.Detail);
-                }
-                catch (OperationCanceledException)
-                {
-                    throw;
-                }
-                catch (Exception ex)
-                {
-                    groupOk = false;
-                    summary.Failed++;
-                    report.Report(new FileReport(file, FileState.Failed, ex.Message, null));
-                    WriteLog(log, file, "", "FAILED", ex.Message);
-                }
-            }
-
-            // Step 4: delete from the phone only when the whole group is safe on the PC.
-            foreach (var (file, pcPath, check) in copied)
-            {
-                if (!deleteAfterCopy)
-                {
-                    summary.CopiedOnly++;
-                    report.Report(new FileReport(file, FileState.Copied, "copied, " + check.Detail, pcPath));
-                    continue;
-                }
-                if (!groupOk)
-                {
-                    summary.CopiedOnly++;
-                    string why = check.Status == CheckStatus.NotSupported
-                        ? $"copied but NOT deleted: {check.Detail}"
-                        : "copied but NOT deleted: another file of the same photo failed";
-                    report.Report(new FileReport(file, FileState.Copied, why, pcPath));
-                    WriteLog(log, file, pcPath, "kept on phone", why);
-                    continue;
-                }
-
-                string? error = DeleteFromPhone(file);
-                if (error is null)
-                {
-                    summary.Moved++;
-                    report.Report(new FileReport(file, FileState.Moved, "moved, " + check.Detail, pcPath));
-                    WriteLog(log, file, pcPath, "deleted from phone", "");
-                }
-                else
-                {
-                    summary.Failed++;
-                    report.Report(new FileReport(file, FileState.Failed, "copied, but " + error, pcPath));
-                    WriteLog(log, file, pcPath, "DELETE FAILED", error);
-                }
+                WaitForFreeSpace(group, ct);
+                RunGroup(group, summary, ct);
+                if (failuresInRow >= MaxFailuresInRow)
+                    throw new IOException($"Stopped: {failuresInRow} files failed one after another. " +
+                                          "Is the iPhone still connected and unlocked? Start the move again to continue.");
             }
         }
+        finally
+        {
+            foreach (var w in logs.Values)
+                w.Dispose();
+            logs.Clear();
+        }
         return summary;
+    }
+
+    /// <summary>
+    /// Before each photo: when the destination drive has less than 1 GB free (after this photo),
+    /// pause and ask the user to free space. Retry checks again; Stop ends the run.
+    /// </summary>
+    private void WaitForFreeSpace(List<DeviceFile> group, CancellationToken ct)
+    {
+        long need = group.Sum(f => Math.Max(0, f.Size));
+        var drive = new DriveInfo(Path.GetPathRoot(Path.GetFullPath(destinationRoot))!);
+        while (true)
+        {
+            ct.ThrowIfCancellationRequested();
+            long free = drive.AvailableFreeSpace;
+            if (free - need >= MinFreeSpace)
+                return;
+            string message =
+                $"The destination drive {drive.Name} has only {free / (1024.0 * 1024 * 1024):0.00} GB free.\n\n" +
+                "The move is paused. Please free some space on this drive, then click Retry.\n" +
+                "Click Cancel to stop the move (you can continue later).";
+            if (askForSpace is null || !askForSpace(message))
+                throw new OperationCanceledException("Stopped: not enough free space on " + drive.Name);
+        }
+    }
+
+    /// <summary>One photo: copy and check all its files, then delete them from the phone.</summary>
+    private void RunGroup(List<DeviceFile> group, MoveSummary summary, CancellationToken ct)
+    {
+        // Step 1-3: copy and check every file of the group.
+        var copied = new List<(DeviceFile File, string PcPath, CheckResult Check)>();
+        bool groupOk = true;
+        foreach (var file in group)
+        {
+            ct.ThrowIfCancellationRequested();
+            report.Report(new FileReport(file, FileState.Copying, "copying...", null));
+            try
+            {
+                var (pcPath, check, note) = CopyAndCheck(file, ct);
+                copied.Add((file, pcPath, check));
+                if (check.Status != CheckStatus.Valid)
+                    groupOk = false;
+                summary.Bytes += file.Size;
+                failuresInRow = 0;
+                WriteLog(file, pcPath, "copied", note + check.Detail);
+            }
+            catch (OperationCanceledException)
+            {
+                throw;
+            }
+            catch (Exception ex)
+            {
+                groupOk = false;
+                summary.Failed++;
+                failuresInRow++;
+                report.Report(new FileReport(file, FileState.Failed, ex.Message, null));
+                WriteLog(file, "", "FAILED", ex.Message);
+            }
+        }
+
+        // Step 4: delete from the phone only when the whole group is safe on the PC.
+        foreach (var (file, pcPath, check) in copied)
+        {
+            if (!deleteAfterCopy)
+            {
+                summary.CopiedOnly++;
+                report.Report(new FileReport(file, FileState.Copied, "copied, " + check.Detail, pcPath));
+                continue;
+            }
+            if (!groupOk)
+            {
+                summary.CopiedOnly++;
+                string why = check.Status == CheckStatus.NotSupported
+                    ? $"copied but NOT deleted: {check.Detail}"
+                    : "copied but NOT deleted: another file of the same photo failed";
+                report.Report(new FileReport(file, FileState.Copied, why, pcPath));
+                WriteLog(file, pcPath, "kept on phone", why);
+                continue;
+            }
+
+            string? error = DeleteFromPhone(file);
+            if (error is null)
+            {
+                summary.Moved++;
+                report.Report(new FileReport(file, FileState.Moved, "moved, " + check.Detail, pcPath));
+                WriteLog(file, pcPath, "deleted from phone", "");
+            }
+            else
+            {
+                summary.Failed++;
+                failuresInRow++;
+                report.Report(new FileReport(file, FileState.Failed, "copied, but " + error, pcPath));
+                WriteLog(file, pcPath, "DELETE FAILED", error);
+            }
+        }
+    }
+
+    /// <summary>
+    /// The PC folder for a phone file: &lt;destination&gt;\&lt;phone folder name&gt;, for example
+    /// "DCIM\202605__" → "&lt;destination&gt;\202605__". The DCIM level is not kept.
+    /// </summary>
+    internal static string TargetFolder(string destinationRoot, string phoneFolder)
+    {
+        string last = phoneFolder.Split('\\', '/', StringSplitOptions.RemoveEmptyEntries).LastOrDefault() ?? "";
+        return last.Length == 0 ? destinationRoot : Path.Combine(destinationRoot, SafeName(last));
     }
 
     private (string PcPath, CheckResult Check, string Note) CopyAndCheck(DeviceFile file, CancellationToken ct)
@@ -126,7 +187,7 @@ internal sealed class MoveEngine(
             throw new IOException("the phone did not report the file size, so the copy cannot be checked");
 
         string ext = Path.GetExtension(file.Name);
-        string dir = Path.Combine(destinationRoot, SafeRelativeFolder(file.Folder));
+        string dir = TargetFolder(destinationRoot, file.Folder);
         Directory.CreateDirectory(dir);
         string dest = Path.Combine(dir, SafeName(file.Name));
 
@@ -223,9 +284,6 @@ internal sealed class MoveEngine(
         return s.Length == 0 || s == ".." ? "_" : s;
     }
 
-    internal static string SafeRelativeFolder(string folder) =>
-        Path.Combine(folder.Split('\\', '/', StringSplitOptions.RemoveEmptyEntries).Select(SafeName).ToArray());
-
     internal static string UniqueName(string path)
     {
         string dir = Path.GetDirectoryName(path)!;
@@ -257,21 +315,32 @@ internal sealed class MoveEngine(
         try { File.Delete(path); } catch (IOException) { } catch (UnauthorizedAccessException) { }
     }
 
-    private StreamWriter OpenLog()
+    /// <summary>One log per PC folder: &lt;destination&gt;\202605__\iphone-mover-log.csv.</summary>
+    private StreamWriter LogFor(DeviceFile file)
     {
-        string path = Path.Combine(destinationRoot, LogFileName);
+        string dir = TargetFolder(destinationRoot, file.Folder);
+        if (logs.TryGetValue(dir, out var w))
+            return w;
+        Directory.CreateDirectory(dir);
+        string path = Path.Combine(dir, LogFileName);
         bool isNew = !File.Exists(path);
-        var w = new StreamWriter(path, append: true, new UTF8Encoding(true)) { AutoFlush = true };
+        w = new StreamWriter(path, append: true, new UTF8Encoding(true)) { AutoFlush = true };
         if (isNew)
             w.WriteLine("time,phone_path,pc_path,size,result,detail");
+        logs[dir] = w;
         return w;
     }
 
-    private static void WriteLog(StreamWriter log, DeviceFile file, string pcPath, string result, string detail)
+    private void WriteLog(DeviceFile file, string pcPath, string result, string detail)
     {
         static string Q(string s) => "\"" + s.Replace("\"", "\"\"") + "\"";
-        log.WriteLine(string.Join(",",
-            DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture),
-            Q(file.DevicePath), Q(pcPath), file.Size.ToString(CultureInfo.InvariantCulture), Q(result), Q(detail)));
+        try
+        {
+            LogFor(file).WriteLine(string.Join(",",
+                DateTime.Now.ToString("yyyy-MM-dd HH:mm:ss", CultureInfo.InvariantCulture),
+                Q(file.DevicePath), Q(pcPath), file.Size.ToString(CultureInfo.InvariantCulture), Q(result), Q(detail)));
+        }
+        catch (IOException) { }               // a log problem must not stop the move
+        catch (UnauthorizedAccessException) { }
     }
 }

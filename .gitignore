@@ -485,3 +485,27 @@ $RECYCLE.BIN/
 
 # publish output
 publish/
+
+# ---- private data and credentials (public repo) ----
+# app settings and logs (contain device ids, local paths, file names)
+settings.json
+last-folder.txt
+iphone-mover-log.csv
+*.csv
+# local test output
+copytest*/
+# secrets and signing keys
+.env
+.env.*
+*.pfx
+*.p12
+*.snk
+*.key
+*.pem
+secrets.json
+appsettings.*.local.json
+*.local.json
+# release artifacts
+release/
+*.zip
+publish-standalone/

@@ -1,39 +1,54 @@
 # iPhone Mover
 
+<img src="docs/icon.png" width="64" align="right" alt="icon">
+
 A small Windows app that **moves** photos and videos from an iPhone (connected with USB) to a folder on the PC.
 
-"Move" means: for each file, the app copies it, checks the copy, and only then deletes it from the iPhone.
+"Move" means: for each photo, the app copies it, checks the copy, and only then deletes it from the iPhone.
+
+**Download:** see [Releases](../../releases/latest).
+- `IphoneMover.exe` is small, and it needs the [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0) (x64).
+- `IphoneMover-standalone.exe` is large, and it needs nothing else.
 
 ```
-┌ iPhone: [Apple iPhone ▼] [Find devices] [Load files from phone] ───────────────┐
-│ On the iPhone                         │ On this PC                             │
-│ Folder: [DCIM\100APPLE (312 files) ▼]◀▶│                                        │
-│ ☑ IMG_0001.HEIC  DCIM\100APPLE 2.1 MB │ [D:\ ▼] [Up] [New folder] [Refresh]    │
-│ ☑ IMG_0001.MOV   DCIM\100APPLE 3.4 MB │ Destination: D:\Photos\iPhone          │
-│ ☐ IMG_0002.JPG   DCIM\100APPLE 1.8 MB │ 📁 100APPLE                             │
-├───────────────────────────────────────┴────────────────────────────────────────┤
-│ ☑ Delete from iPhone after verified copy   [Move checked files →] [Cancel] ▓▓░ │
-│ log ...                                                                         │
+┌ iPhone: [Apple iPhone ▼] [Find devices] [Reload files from phone] ──────────────┐
+│ On the iPhone                          │ On this PC                             │
+│ Show: (•) Folders ( ) Files            │ [D:\ ▼] [Up] [New folder] [Refresh]    │
+│ ☑ 202604__   412 files  622 MB         │ Destination: D:\Photos\iPhone          │
+│ ☑ 202605__   513 files  888 MB  moving │ 📁 202603__   (right-click: delete,     │
+│ ☑ 202606__   379 files  759 MB         │ 📁 202604__    rename, open, ...)       │
+├────────────────────────────────────────┴────────────────────────────────────────┤
+│ ☑ Delete from iPhone after verified copy  [Move checked folders →] [Stop] ▓▓░  │
+│ 1,204 / 1,304 files — 2.1 GB of 2.2 GB — 31 MB/s — left: 0:00:42               │
 └─────────────────────────────────────────────────────────────────────────────────┘
 ```
 
-- Left list: the files on the iPhone (name, folder, size, date, status).
-- Right list: the folders and files on the PC. The **Destination** folder is where files go.
-- No image preview, so the app stays fast and simple.
+## Main features
 
-## How a file is moved
+- **Folder view** (default): one row per phone folder (iOS makes one per month, for example `202605__`), with the file count, size and date range. Check all folders, click **Move**, and leave the computer.
+- **File view**: the files of one folder (or all files) for moving single files.
+- **One photo at a time**: copy → check → delete → next photo. You can stop or close the app at any time. Next time, check the folders again and click Move: it continues with the rest.
+- **The same folders on the PC**: phone folder `DCIM\202605__` becomes `<Destination>\202605__\`. There is no `DCIM` level. A log file `iphone-mover-log.csv` is in each folder.
+- **All file types** in a folder are moved: photos, videos, `.AAE`, and so on.
+- Folders with no files left are not shown.
+- **Low disk space**: before each photo, the app checks the destination drive. If less than **1 GB** would be free, the move **pauses** and asks you to free space (Retry / Cancel).
+- **Safe for long runs**: the PC does not go to sleep during a move. The move stops by itself after 10 failures in a row (for example if the phone is unplugged or locked).
+- **PC side**: right-click menu with Open, Show in Explorer, New folder, Rename (F2), Delete to Recycle Bin (Del), and Delete permanently (Shift+Del).
+- **Remembers** the device, the view, the phone folder, and the PC folder. On start, it loads the phone automatically. If something is not found, it uses the first device or drive.
+
+## How a photo is moved
 
 For every photo, these steps run in order:
 
-1. **Copy** the file from the phone to `<Destination>\<phone folder>\<name>.part`.
+1. **Copy** each file from the phone to `<Destination>\<phone folder>\<name>.part`.
 2. **Size check**: the bytes received and the file size on disk must both equal the size the iPhone reports.
 3. **Format check** (header and structure, see below). If a check fails, the `.part` file is removed and the photo stays on the phone.
 4. **Rename** `.part` to the real name. Set the file dates from the phone.
-5. **Delete** from the iPhone. This only happens if every file of the same photo passed all checks.
+5. **Delete** from the iPhone, but only if every file of the same photo passed all checks.
    - The app deletes with WPD. If that fails, it sends the PTP `DeleteObject` operation directly to the phone.
    - Then it asks the **phone itself** (PTP `GetObjectInfo`) if the file is gone. It does not ask the Windows driver, because the driver can still show a deleted file from its cache.
 
-Every action is written to `iphone-mover-log.csv` in the Destination folder.
+If a file is already on the PC (same size, valid format), it is not copied again. Only the delete step runs.
 
 ### Files that belong together
 
@@ -46,7 +61,7 @@ iOS stores one photo as several files, for example:
 | `IMG_E1234.HEIC` | the edited version |
 | `IMG_1234.AAE` | the edit settings |
 
-If iOS deletes one of them, it can remove the whole photo. So the app always moves these files **as one group**. If you check one of them, the others are added for you, and the confirm dialog tells you. If any file in the group fails, nothing in the group is deleted.
+If iOS deletes one of them, it can remove the whole photo. So the app always moves these files **as one group**: it copies and checks all of them, then it deletes all of them. If any file in the group fails, nothing in the group is deleted.
 
 ### Format checks
 
@@ -67,33 +82,28 @@ Other file types are copied but **never deleted**, because they cannot be checke
 
 1. **Settings → Photos → Transfer to Mac or PC → "Keep Originals"**.
    If this is "Automatic", iOS converts HEIC to JPG while copying. Then the size does not match, and the app will not delete anything.
-2. **iCloud Photos should be OFF**. If it is ON:
-   - the phone often refuses delete over USB (the app shows "the phone refused"), and
-   - with "Optimize iPhone Storage", the phone only has small versions of many photos.
-3. **Unlock** the phone and tap **Trust** when you connect it. Keep it unlocked while the list loads.
+2. **iCloud Photos should be OFF**. If it is ON, the phone may refuse deletes over USB, and with "Optimize iPhone Storage" the phone only has small versions of many photos.
+3. **Unlock** the phone and tap **Trust** when you connect it.
+4. For a long move: set **Settings → Display & Brightness → Auto-Lock → Never** while the move runs, and keep the phone charging.
 
 > ⚠️ A photo deleted from the PC may **not** go to "Recently Deleted" on the phone. Test with a few photos first. You can also uncheck **"Delete from iPhone after verified copy"** to only copy.
 
 ## How to use
 
 1. Connect the iPhone with USB, unlock it, and tap **Trust**.
-2. Start `IphoneMover.exe`. The iPhone is selected in the top list. If not, click **Find devices**.
-3. Click **Load files from phone**. This is fast: about 4 seconds for 25,000 files.
-4. On the right side, pick the drive and folder. You can use **New folder**.
-5. **Work chunk by chunk.** iOS keeps one folder per month (for example `DCIM\202606__`). The **Folder** box on the left shows one folder at a time, with its file count and size. Use ◀ ▶ to go to the previous or next folder. Choose "All folders" to see everything.
-6. Check the files on the left. You can use **Check all shown**, or select rows and click **Check selected rows**. Click a column header to sort. Checks are kept when you change folders. The label shows the total checked in all folders.
-7. Click **Move checked files →** and confirm.
-8. Watch the **Status** column:
-   - ✔ moved (copied, checked, and deleted from the phone)
-   - ◐ copied but kept on the phone (the reason is shown)
-   - ✖ failed (the file is still on the phone)
-
-If you run it again on the same folder, files that are already on the PC (same size, valid format) are not copied again. Only the delete step runs for them.
+2. Start `IphoneMover.exe`. It finds the iPhone and loads the folder list (about 4 seconds for 25,000 files). If not, click **Find devices**.
+3. On the right side, pick the drive and the destination folder. You can use **New folder**.
+4. On the left, click **Check all shown** (or check single folders). Double-click a folder to see its files.
+5. Click **Move checked folders →** and confirm.
+6. Watch the **Status** column:
+   - Folder view: `moving... 312 left`, then `✔ all moved`.
+   - File view: ✔ moved, ◐ copied but kept on the phone (the reason is shown), ✖ failed (the file is still on the phone).
+7. To continue later: start the app, check the folders again, and click Move.
 
 ## Requirements
 
 - Windows 10 or 11, 64-bit.
-- [.NET 8 Desktop Runtime](https://dotnet.microsoft.com/download/dotnet/8.0) (x64).
+- The .NET 8 Desktop Runtime (x64). This is not needed for the standalone exe.
 - Windows must see the iPhone as "Apple iPhone" under *This PC*. If it does not, install the **Apple Devices** app (or iTunes) from the Microsoft Store for the USB driver.
 
 ## Build
@@ -102,9 +112,10 @@ If you run it again on the same folder, files that are already on the PC (same s
 dotnet build -c Release
 dotnet test -c Release
 dotnet publish src/IphoneMover -c Release -p:PublishSingleFile=true -o publish
+dotnet publish src/IphoneMover -c Release -p:PublishSingleFile=true --self-contained true -p:EnableCompressionInSingleFile=true -o publish-standalone
 ```
 
-`publish/IphoneMover.exe` is one file (it needs the .NET 8 Desktop Runtime).
+The icon is drawn by `tools/make-icon.ps1`. Run it to create `src/IphoneMover/app.ico` again.
 
 ### Test with a real iPhone (copy only, never deletes)
 
@@ -129,14 +140,19 @@ It prints the storage access rights, the `CanDelete` flags, and the PTP operatio
 | Path | What it does |
 |---|---|
 | `src/IphoneMover/Wpd/WpdInterop.cs` | COM interface definitions for **WPD** (Windows Portable Devices), the Windows API for MTP/PTP devices. |
-| `src/IphoneMover/Wpd/WpdDevice.cs` | List devices, list files, download a file (`IPortableDeviceResources.GetStream`), delete by object ID (`IPortableDeviceContent.Delete`). |
+| `src/IphoneMover/Wpd/WpdDevice.cs` | List devices and files, download (`IPortableDeviceResources.GetStream`), delete (`IPortableDeviceContent.Delete`), and raw PTP commands (`WPD_COMMAND_MTP_EXT_*`). |
 | `src/IphoneMover/Wpd/WpdWorker.cs` | All WPD calls run on one MTA background thread. |
 | `src/IphoneMover/Core/FormatValidator.cs` | The format checks. |
 | `src/IphoneMover/Core/AssetGrouping.cs` | Groups the files of one photo (Live Photo, edits, AAE). |
-| `src/IphoneMover/Core/MoveEngine.cs` | Copy → check → rename → delete, plus the CSV log. |
+| `src/IphoneMover/Core/MoveEngine.cs` | Copy → check → rename → delete, free-space pause, and the CSV logs. |
 | `src/IphoneMover/MainForm.cs` | The WinForms window. |
-| `tests/IphoneMover.Tests` | xUnit tests for the format checks and grouping, plus the optional real-device copy test. |
+| `src/IphoneMover/Settings.cs` | Remembered settings in `%AppData%\IphoneMover\settings.json`. |
+| `tests/IphoneMover.Tests` | xUnit tests, plus the optional real-device tests. |
 
 The WPD interface layouts were cross-checked with [MediaDevices](https://github.com/Bassman2/MediaDevices) (MIT). The idea of reading `WPD_OBJECT_ORIGINAL_FILE_NAME` (the iPhone hides extensions in the normal name) comes from [iphone-photo-importer](https://github.com/mccubbinds/iphone-photo-importer).
 
 The app does not use libimobiledevice/AFC. Deleting files with AFC does not update the iOS Photos database, so the deleted photos still show in the Photos app as broken "ghost" items. A delete over WPD/PTP goes through iOS, which updates the library correctly.
+
+## License
+
+[MIT](LICENSE)
