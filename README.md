@@ -29,7 +29,9 @@ For every photo, these steps run in order:
 2. **Size check**: the bytes received and the file size on disk must both equal the size the iPhone reports.
 3. **Format check** (header and structure, see below). If a check fails, the `.part` file is removed and the photo stays on the phone.
 4. **Rename** `.part` to the real name. Set the file dates from the phone.
-5. **Delete** from the iPhone. This only happens if every file of the same photo passed all checks. After the delete, the app asks the phone again, to make sure the file is really gone.
+5. **Delete** from the iPhone. This only happens if every file of the same photo passed all checks.
+   - The app deletes with WPD. If that fails, it sends the PTP `DeleteObject` operation directly to the phone.
+   - Then it asks the **phone itself** (PTP `GetObjectInfo`) if the file is gone. It does not ask the Windows driver, because the driver can still show a deleted file from its cache.
 
 Every action is written to `iphone-mover-log.csv` in the Destination folder.
 
@@ -112,6 +114,15 @@ dotnet test -c Release --filter DeviceCopyTests --logger "console;verbosity=deta
 ```
 
 It lists the phone, copies the smallest JPG, HEIC and MOV to that folder, checks them, and checks that they are still on the phone. Without the variable, this test does nothing.
+
+### Delete diagnostic (read-only)
+
+```
+set IPHONE_DIAG=1
+dotnet test -c Release --filter DeviceDiagnosticTests --logger "console;verbosity=detailed"
+```
+
+It prints the storage access rights, the `CanDelete` flags, and the PTP operations the phone supports (`DeleteObject` = 0x100B). Tested with an iPhone on iOS 16.3.1: `DeleteObject` is supported and the storage is read/write.
 
 ## How it works (for developers)
 

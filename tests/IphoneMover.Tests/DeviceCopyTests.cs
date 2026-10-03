@@ -1,4 +1,4 @@
-using IphoneMover.Core;
+﻿using IphoneMover.Core;
 using IphoneMover.Wpd;
 using Xunit.Abstractions;
 
@@ -45,7 +45,7 @@ public sealed class DeviceCopyTests(ITestOutputHelper output)
         Assert.Equal(0, summary.Failed);
         Assert.Equal(pick.Count, summary.CopiedOnly);
         foreach (var f in pick)
-            Assert.True(device.Exists(f.ObjectId), "file must still be on the phone");
+            Assert.True(device.ExistsOnPhone(f.ObjectId) == true, "file must still be on the phone");
     }
 
     private sealed class SyncProgress<T>(Action<T> action) : IProgress<T>

@@ -39,7 +39,7 @@ internal sealed class MoveEngine(
     private const string KeepOriginalsHint =
         " Tip: on the iPhone set Settings > Photos > Transfer to Mac or PC = \"Keep Originals\".";
     private const string ReadOnlyHint =
-        " The phone refused. Is iCloud Photos turned on? Then the phone does not allow delete over USB.";
+        " The phone refused. Possible reasons: iCloud Photos is on, or the photo was synced from a computer (iTunes).";
 
     private long bytesDone;
 
@@ -195,12 +195,19 @@ internal sealed class MoveEngine(
         int hr = device.Delete(file.ObjectId);
         if (HResult.IsNotFound(hr))
             return null; // iOS already removed it together with another file of the same photo
-        if (hr == HResult.S_FALSE)
-            return "NOT deleted: the phone refused." + ReadOnlyHint;
-        if (hr < 0)
-            return "NOT deleted: " + WpdException.Describe(hr) + (hr == HResult.E_ACCESSDENIED ? ReadOnlyHint : "");
-        if (device.Exists(file.ObjectId))
-            return "NOT deleted: the phone said OK but the file is still there." + ReadOnlyHint;
+
+        if (hr < 0 || hr == HResult.S_FALSE)
+        {
+            // Fallback: send the PTP DeleteObject operation directly to the phone.
+            var ptp = device.PtpDelete(file.ObjectId);
+            if (!ptp.Ok && ptp.ResponseCode != 0x2009 /* already gone */)
+                return $"NOT deleted: WPD delete gave {WpdException.Describe(hr)}, PTP DeleteObject gave {ptp}." +
+                       (hr == HResult.E_ACCESSDENIED ? ReadOnlyHint : "");
+        }
+
+        // Confirm with the phone itself. (The Windows driver can still show a deleted file from its cache.)
+        if (device.ExistsOnPhone(file.ObjectId) == true)
+            return "NOT deleted: the phone still has the file after the delete.";
         return null;
     }
 

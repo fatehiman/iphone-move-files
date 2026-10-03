@@ -29,6 +29,7 @@ internal struct PropVariant
 {
     public const ushort VT_EMPTY = 0;
     public const ushort VT_DATE = 7;
+    public const ushort VT_UI4 = 19;
     public const ushort VT_LPWSTR = 31;
 
     [FieldOffset(0)] public ushort vt;
@@ -88,6 +89,31 @@ internal static class WpdKeys
     public static readonly PropertyKey ObjectDateCreated = new(ObjectProps, 18);
     public static readonly PropertyKey ObjectDateModified = new(ObjectProps, 19);
     public static readonly PropertyKey ObjectCanDelete = new(ObjectProps, 26);
+
+    public static readonly PropertyKey StorageAccessCapability = new(new Guid("01A3057A-74D6-4E80-BEA7-DC4C212CE50A"), 11);
+    public static readonly PropertyKey DeviceProtocol = new(new Guid("26D4979A-E643-4626-9E2B-736DC0C92FDC"), 6);
+
+    // WPD_COMMON command parameters
+    private static readonly Guid CategoryCommon = new("F0422A9C-5DC8-4440-B5BD-5DF28835658A");
+    public static readonly PropertyKey CommonCommandCategory = new(CategoryCommon, 1001);
+    public static readonly PropertyKey CommonCommandId = new(CategoryCommon, 1002);
+    public static readonly PropertyKey CommonHResult = new(CategoryCommon, 1003);
+
+    // MTP extension commands: send raw MTP/PTP operations to the device.
+    private static readonly Guid CategoryMtpExt = new("4D545058-1A2E-4106-A357-771E0819FC56");
+    public static readonly PropertyKey MtpExtExecuteWithoutData = new(CategoryMtpExt, 12);
+    public static readonly PropertyKey MtpExtExecuteWithDataToRead = new(CategoryMtpExt, 13);
+    public static readonly PropertyKey MtpExtReadData = new(CategoryMtpExt, 15);
+    public static readonly PropertyKey MtpExtEndDataTransfer = new(CategoryMtpExt, 17);
+    public static readonly PropertyKey MtpExtOperationCode = new(CategoryMtpExt, 1001);
+    public static readonly PropertyKey MtpExtOperationParams = new(CategoryMtpExt, 1002);
+    public static readonly PropertyKey MtpExtResponseCode = new(CategoryMtpExt, 1003);
+    public static readonly PropertyKey MtpExtResponseParams = new(CategoryMtpExt, 1004);
+    public static readonly PropertyKey MtpExtTransferContext = new(CategoryMtpExt, 1006);
+    public static readonly PropertyKey MtpExtTransferTotalDataSize = new(CategoryMtpExt, 1007);
+    public static readonly PropertyKey MtpExtTransferNumBytesToRead = new(CategoryMtpExt, 1008);
+    public static readonly PropertyKey MtpExtTransferNumBytesRead = new(CategoryMtpExt, 1009);
+    public static readonly PropertyKey MtpExtTransferData = new(CategoryMtpExt, 1012);
 
     public static readonly PropertyKey ResourceDefault = new(new Guid("E81E79BE-34F0-41BF-B53F-F1A06AE87842"), 0);
 
@@ -228,4 +254,10 @@ internal interface IPortableDeviceValues
     [PreserveSig] int GetIUnknownValue(ref PropertyKey key, [MarshalAs(UnmanagedType.IUnknown)] out object value);
     [PreserveSig] int SetGuidValue(ref PropertyKey key, ref Guid value);
     [PreserveSig] int GetGuidValue(ref PropertyKey key, out Guid value);
+    [PreserveSig] int SetBufferValue(ref PropertyKey key, IntPtr pValue, uint cbValue);
+    [PreserveSig] int GetBufferValue(ref PropertyKey key, out IntPtr ppValue, out uint pcbValue);
+    [PreserveSig] int SetIPortableDeviceValuesValue(ref PropertyKey key, IPortableDeviceValues value);
+    [PreserveSig] int GetIPortableDeviceValuesValue(ref PropertyKey key, out IPortableDeviceValues value);
+    [PreserveSig] int SetIPortableDevicePropVariantCollectionValue(ref PropertyKey key, IPortableDevicePropVariantCollection value);
+    [PreserveSig] int GetIPortableDevicePropVariantCollectionValue(ref PropertyKey key, out IPortableDevicePropVariantCollection value);
 }

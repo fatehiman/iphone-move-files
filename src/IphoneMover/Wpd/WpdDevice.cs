@@ -250,7 +250,10 @@ internal sealed class WpdDevice : IDisposable
         }
     }
 
-    /// <summary>True when the object still exists on the phone.</summary>
+    /// <summary>
+    /// True when the object is still known to the driver. Note: after a delete the driver can keep
+    /// the old properties in its cache, so use <see cref="ExistsOnPhone"/> to confirm a delete.
+    /// </summary>
     public bool Exists(string objectId) => Worker.Invoke(() =>
     {
         int hr = properties!.GetValues(objectId, keys, out var values);
@@ -258,6 +261,43 @@ internal sealed class WpdDevice : IDisposable
             Marshal.ReleaseComObject(values);
         return hr >= 0;
     });
+
+    private const ushort PtpGetObjectInfo = 0x1008;
+    private const ushort PtpDeleteObject = 0x100B;
+    private const uint PtpResponseOk = 0x2001;
+    private const uint PtpResponseInvalidObjectHandle = 0x2009;
+
+    /// <summary>The MTP/PTP object handle. The Windows MTP driver uses object IDs like "oCA46" (handle 0xCA46).</summary>
+    internal static bool TryGetHandle(string objectId, out uint handle)
+    {
+        handle = 0;
+        return objectId.Length > 1 && objectId[0] == 'o' &&
+               uint.TryParse(objectId.AsSpan(1), System.Globalization.NumberStyles.HexNumber, null, out handle);
+    }
+
+    /// <summary>
+    /// Asks the phone directly (PTP GetObjectInfo), not the driver cache.
+    /// Returns null when the answer is not clear.
+    /// </summary>
+    public bool? ExistsOnPhone(string objectId)
+    {
+        if (!TryGetHandle(objectId, out uint handle))
+            return null;
+        var r = MtpReadCommand(PtpGetObjectInfo, handle);
+        if (r.ResponseCode == PtpResponseOk)
+            return true;
+        if (r.ResponseCode == PtpResponseInvalidObjectHandle)
+            return false;
+        return null;
+    }
+
+    /// <summary>Deletes with the raw PTP DeleteObject operation (fallback when the WPD delete fails).</summary>
+    public MtpResult PtpDelete(string objectId)
+    {
+        if (!TryGetHandle(objectId, out uint handle))
+            return new MtpResult(HResult.E_INVALIDARG, 0, [], []);
+        return MtpCommand(PtpDeleteObject, handle, 0);
+    }
 
     // ---------------------------------------------------------------- transfer
 
@@ -317,6 +357,166 @@ internal sealed class WpdDevice : IDisposable
             NativeMethods.PropVariantClear(ref pv);
             Marshal.ReleaseComObject(ids);
         }
+    });
+
+    // ---------------------------------------------------------------- raw MTP / PTP commands
+
+    internal sealed record MtpResult(int HResult, uint ResponseCode, uint[] Params, byte[] Data)
+    {
+        public bool Ok => HResult >= 0 && ResponseCode == 0x2001; // PTP "OK"
+        public override string ToString() =>
+            $"hr=0x{HResult:X8} response=0x{ResponseCode:X4} params=[{string.Join(",", Params.Select(p => $"0x{p:X}"))}] data={Data.Length}B";
+    }
+
+    /// <summary>Sends an MTP/PTP operation that has no data phase (for example DeleteObject 0x100B).</summary>
+    public MtpResult MtpCommand(ushort opcode, params uint[] args) => Worker.Invoke(() =>
+    {
+        var p = NewCommand(WpdKeys.MtpExtExecuteWithoutData);
+        var k = WpdKeys.MtpExtOperationCode; p.SetUnsignedIntegerValue(ref k, opcode);
+        k = WpdKeys.MtpExtOperationParams; p.SetIPortableDevicePropVariantCollectionValue(ref k, UIntCollection(args));
+        int hr = device!.SendCommand(0, p, out var res);
+        if (hr < 0)
+            return new MtpResult(hr, 0, [], []);
+        return ReadResponse(res, []);
+    });
+
+    /// <summary>Sends an MTP/PTP operation that returns data (for example GetDeviceInfo 0x1001).</summary>
+    public MtpResult MtpReadCommand(ushort opcode, params uint[] args) => Worker.Invoke(() =>
+    {
+        var p = NewCommand(WpdKeys.MtpExtExecuteWithDataToRead);
+        var k = WpdKeys.MtpExtOperationCode; p.SetUnsignedIntegerValue(ref k, opcode);
+        k = WpdKeys.MtpExtOperationParams; p.SetIPortableDevicePropVariantCollectionValue(ref k, UIntCollection(args));
+        int hr = device!.SendCommand(0, p, out var res);
+        if (hr < 0)
+            return new MtpResult(hr, 0, [], []);
+        hr = CommandHResult(res);
+        if (hr < 0)
+            return new MtpResult(hr, 0, [], []);
+
+        k = WpdKeys.MtpExtTransferContext; res.GetStringValue(ref k, out string context);
+        k = WpdKeys.MtpExtTransferTotalDataSize; res.GetUnsignedLargeIntegerValue(ref k, out ulong total);
+
+        var data = new MemoryStream();
+        while ((ulong)data.Length < total)
+        {
+            uint chunk = (uint)Math.Min(total - (ulong)data.Length, 256 * 1024);
+            var rp = NewCommand(WpdKeys.MtpExtReadData);
+            k = WpdKeys.MtpExtTransferContext; rp.SetStringValue(ref k, context);
+            k = WpdKeys.MtpExtTransferNumBytesToRead; rp.SetUnsignedIntegerValue(ref k, chunk);
+            IntPtr buf = Marshal.AllocCoTaskMem((int)chunk);
+            try
+            {
+                k = WpdKeys.MtpExtTransferData; rp.SetBufferValue(ref k, buf, chunk);
+            }
+            finally
+            {
+                Marshal.FreeCoTaskMem(buf);
+            }
+            hr = device.SendCommand(0, rp, out var rr);
+            if (hr >= 0) hr = CommandHResult(rr);
+            if (hr < 0)
+                break;
+            k = WpdKeys.MtpExtTransferNumBytesRead; rr.GetUnsignedIntegerValue(ref k, out uint read);
+            k = WpdKeys.MtpExtTransferData;
+            if (read == 0 || rr.GetBufferValue(ref k, out IntPtr pData, out uint cb) < 0)
+                break;
+            var bytes = new byte[Math.Min(read, cb)];
+            Marshal.Copy(pData, bytes, 0, bytes.Length);
+            Marshal.FreeCoTaskMem(pData);
+            data.Write(bytes);
+        }
+
+        var ep = NewCommand(WpdKeys.MtpExtEndDataTransfer);
+        k = WpdKeys.MtpExtTransferContext; ep.SetStringValue(ref k, context);
+        int ehr = device.SendCommand(0, ep, out var er);
+        if (ehr < 0)
+            return new MtpResult(ehr, 0, [], data.ToArray());
+        return ReadResponse(er, data.ToArray());
+    });
+
+    private static IPortableDeviceValues NewCommand(PropertyKey command)
+    {
+        var p = WpdClsid.Create<IPortableDeviceValues>(WpdClsid.PortableDeviceValues);
+        var k = WpdKeys.CommonCommandCategory; var cat = command.fmtid; p.SetGuidValue(ref k, ref cat);
+        k = WpdKeys.CommonCommandId; p.SetUnsignedIntegerValue(ref k, command.pid);
+        return p;
+    }
+
+    private static int CommandHResult(IPortableDeviceValues res)
+    {
+        var k = WpdKeys.CommonHResult;
+        return res.GetErrorValue(ref k, out int hr) >= 0 ? hr : 0;
+    }
+
+    private static MtpResult ReadResponse(IPortableDeviceValues res, byte[] data)
+    {
+        int hr = CommandHResult(res);
+        var k = WpdKeys.MtpExtResponseCode;
+        res.GetUnsignedIntegerValue(ref k, out uint code);
+        var prms = new List<uint>();
+        k = WpdKeys.MtpExtResponseParams;
+        if (res.GetIPortableDevicePropVariantCollectionValue(ref k, out var col) >= 0 && col is not null)
+        {
+            uint n = 0;
+            col.GetCount(ref n);
+            for (uint i = 0; i < n; i++)
+            {
+                var pv = new PropVariant();
+                if (col.GetAt(i, ref pv) >= 0)
+                    prms.Add((uint)pv.longVal);
+                NativeMethods.PropVariantClear(ref pv);
+            }
+        }
+        return new MtpResult(hr, code, [.. prms], data);
+    }
+
+    private static IPortableDevicePropVariantCollection UIntCollection(uint[] values)
+    {
+        var col = WpdClsid.Create<IPortableDevicePropVariantCollection>(WpdClsid.PortableDevicePropVariantCollection);
+        foreach (uint v in values)
+        {
+            var pv = new PropVariant { vt = PropVariant.VT_UI4, longVal = v };
+            col.Add(ref pv);
+        }
+        return col;
+    }
+
+    /// <summary>Diagnostic data: storages with their WPD access capability, and a few raw object properties.</summary>
+    internal List<string> Describe(IEnumerable<string> objectIds) => Worker.Invoke(() =>
+    {
+        var lines = new List<string>();
+        foreach (string storage in EnumChildren(WpdKeys.DeviceObjectId))
+        {
+            properties!.GetValues(storage, null, out var v);
+            var k = WpdKeys.StorageAccessCapability;
+            string cap = v.GetUnsignedIntegerValue(ref k, out uint c) >= 0 ? c.ToString() : "n/a";
+            k = WpdKeys.ObjectName; v.GetStringValue(ref k, out string name);
+            lines.Add($"storage id={storage} name={name} accessCapability={cap} (0=read/write, 1=read-only, 2=read-only but delete allowed)");
+        }
+        foreach (string id in objectIds)
+        {
+            properties!.GetValues(id, null, out var v);
+            uint n = 0;
+            v.GetCount(ref n);
+            var parts = new List<string>();
+            for (uint i = 0; i < n; i++)
+            {
+                var key = new PropertyKey();
+                var pv = new PropVariant();
+                if (v.GetAt(i, ref key, ref pv) < 0) continue;
+                string val = pv.vt switch
+                {
+                    PropVariant.VT_LPWSTR => Marshal.PtrToStringUni(pv.ptr) ?? "",
+                    11 => (pv.longVal & 0xFFFF) != 0 ? "true" : "false",   // VT_BOOL
+                    19 or 21 or 3 => (pv.longVal & (pv.vt == 21 ? -1L : 0xFFFFFFFF)).ToString(),
+                    _ => $"vt{pv.vt}",
+                };
+                NativeMethods.PropVariantClear(ref pv);
+                parts.Add($"{{{key.fmtid}}}/{key.pid}={val}");
+            }
+            lines.Add($"object {id}:\n   " + string.Join("\n   ", parts));
+        }
+        return lines;
     });
 
     public void Dispose()
