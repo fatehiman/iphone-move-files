@@ -37,7 +37,7 @@ internal sealed class WpdDevice : IDisposable
     private IPortableDeviceProperties? properties;
     private IPortableDeviceKeyCollection? keys;
 
-    public DeviceInfo Info { get; }
+    public DeviceInfo Info { get; private set; }
 
     private WpdDevice(DeviceInfo info) => Info = info;
 
@@ -99,6 +99,12 @@ internal sealed class WpdDevice : IDisposable
     public static WpdDevice Open(DeviceInfo info) => Worker.Invoke(() =>
     {
         var d = new WpdDevice(info);
+        d.OpenSession(info);
+        return d;
+    });
+
+    private void OpenSession(DeviceInfo info)
+    {
         var clientInfo = WpdClsid.Create<IPortableDeviceValues>(WpdClsid.PortableDeviceValues);
         var k = WpdKeys.ClientName; clientInfo.SetStringValue(ref k, "iPhone Mover");
         k = WpdKeys.ClientMajorVersion; clientInfo.SetUnsignedIntegerValue(ref k, 1);
@@ -106,14 +112,12 @@ internal sealed class WpdDevice : IDisposable
         k = WpdKeys.ClientRevision; clientInfo.SetUnsignedIntegerValue(ref k, 0);
         k = WpdKeys.ClientSecurityQualityOfService; clientInfo.SetUnsignedIntegerValue(ref k, WpdKeys.SecurityImpersonation);
 
-        d.device = WpdClsid.Create<IPortableDevice>(WpdClsid.PortableDeviceFTM);
-        HResult.Check(d.device.Open(info.Id, clientInfo), "Open device");
-        HResult.Check(d.device.Content(out var c), "IPortableDevice.Content");
-        d.content = c;
+        var dev = WpdClsid.Create<IPortableDevice>(WpdClsid.PortableDeviceFTM);
+        HResult.Check(dev.Open(info.Id, clientInfo), "Open device");
+        HResult.Check(dev.Content(out var c), "IPortableDevice.Content");
         HResult.Check(c.Properties(out var p), "IPortableDeviceContent.Properties");
-        d.properties = p;
 
-        d.keys = WpdClsid.Create<IPortableDeviceKeyCollection>(WpdClsid.PortableDeviceKeyCollection);
+        var kc = WpdClsid.Create<IPortableDeviceKeyCollection>(WpdClsid.PortableDeviceKeyCollection);
         foreach (var key in new[]
         {
             WpdKeys.ObjectContentType, WpdKeys.ObjectName, WpdKeys.ObjectOriginalFileName, WpdKeys.ObjectSize,
@@ -121,14 +125,57 @@ internal sealed class WpdDevice : IDisposable
         })
         {
             var kk = key;
-            d.keys.Add(ref kk);
+            kc.Add(ref kk);
         }
-        return d;
+        Info = info;
+        device = dev;
+        content = c;
+        properties = p;
+        keys = kc;
+    }
+
+    /// <summary>
+    /// Closes the (broken) session and opens a new one. The phone is found again by its id, then by its name,
+    /// then as the first Apple device (the id changes when the cable is moved to another USB port).
+    /// Returns false when the phone is not there (yet). The MTP object ids (handles) stay the same.
+    /// </summary>
+    public bool Reconnect() => Worker.Invoke(() =>
+    {
+        CloseSession();
+        try
+        {
+            var devices = ListDevices();
+            var info = devices.FirstOrDefault(d => d.Id == Info.Id)
+                       ?? devices.FirstOrDefault(d => d.FriendlyName == Info.FriendlyName)
+                       ?? devices.FirstOrDefault(d => d.LooksLikeApple);
+            if (info is null)
+                return false;
+            OpenSession(info);
+            // A real request to the phone: PTP GetDeviceInfo.
+            return MtpReadCommand(0x1001).Ok;
+        }
+        catch (Exception ex) when (ex is WpdException or COMException or InvalidCastException)
+        {
+            CloseSession();
+            return false;
+        }
     });
+
+    private void CloseSession()
+    {
+        try { device?.Close(); } catch (COMException) { }
+        foreach (object? o in new object?[] { keys, properties, content, device })
+            if (o is not null)
+                try { Marshal.ReleaseComObject(o); } catch (ArgumentException) { }
+        keys = null; properties = null; content = null; device = null;
+    }
 
     // ---------------------------------------------------------------- listing
 
-    /// <summary>Lists all files on the device (recursive). Reports the current folder as progress.</summary>
+    /// <summary>
+    /// Lists all files on the device (recursive). Reports "folder — N files" as progress.
+    /// Throws when the connection to the phone is lost (so a cut list is never shown as complete).
+    /// </summary>
     public List<DeviceFile> ListFiles(IProgress<string>? progress, CancellationToken ct) => Worker.Invoke(() =>
     {
         var files = new List<DeviceFile>();
@@ -142,7 +189,8 @@ internal sealed class WpdDevice : IDisposable
     {
         if (depth > 32)
             return;
-        progress?.Report(folder.Length == 0 ? "\\" : folder);
+        string label = folder.Length == 0 ? "\\" : folder;
+        progress?.Report($"{label} — {files.Count:N0} files");
 
         foreach (string id in EnumChildren(parentId))
         {
@@ -150,6 +198,8 @@ internal sealed class WpdDevice : IDisposable
             var obj = ReadObject(id);
             if (obj is null)
                 continue;
+            if (files.Count % 200 == 199)
+                progress?.Report($"{label} — {files.Count + 1:N0} files");
 
             if (obj.Value.IsContainer)
             {
@@ -168,6 +218,8 @@ internal sealed class WpdDevice : IDisposable
     {
         var ids = new List<string>();
         int hr = content!.EnumObjects(0, parentId, null, out var en);
+        if (HResult.IsConnectionLost(hr))
+            throw new WpdException(hr, "List folder on phone");
         if (hr < 0 || en is null)
             return ids;
         try
@@ -179,6 +231,8 @@ internal sealed class WpdDevice : IDisposable
                 hr = en.Next((uint)batch.Length, batch, ref fetched);
                 for (int i = 0; i < fetched; i++)
                     ids.Add(TakeString(batch[i]));
+                if (HResult.IsConnectionLost(hr))
+                    throw new WpdException(hr, "List folder on phone");
                 if (hr != HResult.S_OK || fetched == 0)
                     break;
             }
@@ -194,7 +248,10 @@ internal sealed class WpdDevice : IDisposable
 
     private ObjectProps? ReadObject(string id)
     {
-        if (properties!.GetValues(id, keys, out var values) < 0 || values is null)
+        int hr = properties!.GetValues(id, keys, out var values);
+        if (HResult.IsConnectionLost(hr))
+            throw new WpdException(hr, "Read file info on phone");
+        if (hr < 0 || values is null)
             return null;
         try
         {
@@ -521,15 +578,6 @@ internal sealed class WpdDevice : IDisposable
 
     public void Dispose()
     {
-        Worker.Invoke(() =>
-        {
-            if (device is null)
-                return;
-            device.Close();
-            foreach (object? o in new object?[] { keys, properties, content, device })
-                if (o is not null)
-                    Marshal.ReleaseComObject(o);
-            keys = null; properties = null; content = null; device = null;
-        });
+        Worker.Invoke(CloseSession);
     }
 }

@@ -11,7 +11,7 @@
     <RuntimeIdentifier>win-x64</RuntimeIdentifier>
     <SelfContained>false</SelfContained>
     <AssemblyName>IphoneMover</AssemblyName>
-    <Version>1.1.0</Version>
+    <Version>1.2.0</Version>
     <Product>iPhone Mover</Product>
     <ApplicationIcon>app.ico</ApplicationIcon>
     <Authors>fatehiman</Authors>

@@ -32,7 +32,9 @@ A small Windows app that **moves** photos and videos from an iPhone (connected w
 - **All file types** in a folder are moved: photos, videos, `.AAE`, and so on.
 - Folders with no files left are not shown.
 - **Low disk space**: before each photo, the app checks the destination drive. If less than **1 GB** would be free, the move **pauses** and asks you to free space (Retry / Cancel).
-- **Safe for long runs**: the PC does not go to sleep during a move. The move stops by itself after 10 failures in a row (for example if the phone is unplugged or locked).
+- **Safe for long runs**: the PC does not go to sleep during a move.
+- **Reconnects by itself**: if the connection to the phone breaks (phone locked or asleep, USB reset), the app opens a new connection and repeats the same photo. If the phone does not come back after about 1 minute, the move **pauses** and asks you to unlock or replug the iPhone (Retry / Cancel).
+- The move stops after 10 failures in a row that are not connection problems.
 - **PC side**: right-click menu with Open, Show in Explorer, New folder, Rename (F2), Delete to Recycle Bin (Del), and Delete permanently (Shift+Del).
 - **Remembers** the device, the view, the phone folder, and the PC folder. On start, it loads the phone automatically. If something is not found, it uses the first device or drive.
 
@@ -91,7 +93,7 @@ Other file types are copied but **never deleted**, because they cannot be checke
 ## How to use
 
 1. Connect the iPhone with USB, unlock it, and tap **Trust**.
-2. Start `IphoneMover.exe`. It finds the iPhone and loads the folder list (about 4 seconds for 25,000 files). If not, click **Find devices**.
+2. Start `IphoneMover.exe`. It finds the iPhone and loads the folder list. This is about 4 seconds for 25,000 files. After a lost connection or a replug, Windows has no cache, so it can take **about 2 minutes**. The status line shows the progress, and **Stop** works. If not found, click **Find devices**.
 3. On the right side, pick the drive and the destination folder. You can use **New folder**.
 4. On the left, click **Check all shown** (or check single folders). Double-click a folder to see its files.
 5. Click **Move checked folders →** and confirm.

@@ -299,15 +299,16 @@ internal sealed class MainForm : Form
         SetBusy(true, "Reading the file list from the phone...");
         try
         {
-            if (device is null || device.Info.Id != info.Id)
-            {
-                device?.Dispose();
-                device = null;
-                device = await Task.Run(() => WpdDevice.Open(info));
-            }
+            // Always a new session: an old one may be broken (phone was locked, cable moved).
+            var old = device;
+            device = null;
+            if (old is not null)
+                await Task.Run(old.Dispose);
+            device = await Task.Run(() => WpdDevice.Open(info));
             RememberDevice();
 
-            var progress = new Progress<string>(folder => statusLabel.Text = "Reading " + folder);
+            var progress = new Progress<string>(text => statusLabel.Text = "Reading " + text +
+                " (after a lost connection this can take a few minutes; Stop is possible)");
             var dev = device;
             var token = cts.Token;
             var sw = Stopwatch.StartNew();
@@ -329,6 +330,8 @@ internal sealed class MainForm : Form
         catch (Exception ex)
         {
             Log("Could not read the phone: " + ex.Message);
+            Log("Unlock the iPhone. If that does not help, unplug the cable, plug it in again, tap \"Trust\", " +
+                "then click \"Find devices\".");
             device?.Dispose();
             device = null;
         }
@@ -962,7 +965,8 @@ internal sealed class MainForm : Form
         Log($"--- {(delete ? "MOVE" : "COPY")} {all.Count:N0} files from {folders.Count:N0} folder(s) to {dest}");
 
         var report = new Progress<FileReport>(OnFileReport);
-        var engine = new MoveEngine(device, dest, delete, report, n => Interlocked.Exchange(ref progressBytes, n), AskForSpace);
+        var engine = new MoveEngine(device, dest, delete, report, n => Interlocked.Exchange(ref progressBytes, n),
+            AskUser, line => BeginInvoke(() => Log(line)));
         var token = cts.Token;
         KeepAwake(true); // a long move must not be stopped by PC sleep
         try
@@ -1043,15 +1047,18 @@ internal sealed class MainForm : Form
         }
     }
 
-    /// <summary>Called from the move thread when the disk is almost full. Blocks until the user answers.</summary>
-    private bool AskForSpace(string message) => (bool)Invoke(() =>
+    /// <summary>
+    /// Called from the move thread when the move must pause (low disk space, phone connection lost).
+    /// Blocks until the user answers. Retry = true.
+    /// </summary>
+    private bool AskUser(string message) => (bool)Invoke(() =>
     {
-        Log("Paused: low disk space.");
-        statusLabel.Text = "PAUSED — low disk space";
+        string firstLine = message.Split('\n')[0];
+        Log("PAUSED: " + firstLine);
+        statusLabel.Text = "PAUSED — waiting for you";
         var answer = MessageBox.Show(this, message, Text + " — paused", MessageBoxButtons.RetryCancel, MessageBoxIcon.Warning);
         LoadDrives();
-        if (answer == DialogResult.Retry)
-            Log("Continue after low disk space.");
+        Log(answer == DialogResult.Retry ? "Retry." : "Cancel.");
         return answer == DialogResult.Retry;
     });
 
@@ -1152,7 +1159,11 @@ internal sealed class MainForm : Form
             cts.Cancel();
         }
         Settings.Save();
-        device?.Dispose();
+        // Do not let a phone that does not answer block the window: wait at most 2 seconds.
+        var d = device;
+        device = null;
+        if (d is not null)
+            Task.Run(d.Dispose).Wait(TimeSpan.FromSeconds(2));
     }
 
     internal static string FormatSize(long bytes)

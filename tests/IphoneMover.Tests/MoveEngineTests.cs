@@ -15,6 +15,17 @@ public sealed class MoveEngineTests
         Assert.Equal(expected, MoveEngine.TargetFolder(@"D:\Photos", phoneFolder));
     }
 
+    [Theory]
+    [InlineData(unchecked((int)0x802A0002), true)]  // the error seen when the session broke
+    [InlineData(unchecked((int)0x8007048F), true)]  // device not connected
+    [InlineData(unchecked((int)0x80070002), false)] // file not found: not a connection problem
+    [InlineData(unchecked((int)0x80070005), false)] // access denied
+    [InlineData(0, false)]
+    public void IsConnectionLost(int hr, bool expected)
+    {
+        Assert.Equal(expected, IphoneMover.Wpd.HResult.IsConnectionLost(hr));
+    }
+
     [Fact]
     public void SafeName_ReplacesInvalidCharacters()
     {

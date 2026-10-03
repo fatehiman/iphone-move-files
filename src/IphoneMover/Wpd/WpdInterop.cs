@@ -56,6 +56,20 @@ internal static class HResult
 
     public static bool IsNotFound(int hr) => hr == E_FILE_NOT_FOUND || hr == E_NOT_FOUND;
 
+    /// <summary>
+    /// The session with the phone is broken (phone locked/asleep, cable moved, USB reset):
+    /// any WPD-facility error (0x802A....), for example 0x802A0002, or a Win32 "device gone" error.
+    /// </summary>
+    public static bool IsConnectionLost(int hr) =>
+        (hr & unchecked((int)0xFFFF0000)) == unchecked((int)0x802A0000)
+        || hr == unchecked((int)0x8007048F)   // ERROR_DEVICE_NOT_CONNECTED
+        || hr == unchecked((int)0x80070015)   // ERROR_NOT_READY
+        || hr == unchecked((int)0x8007001F)   // ERROR_GEN_FAILURE
+        || hr == unchecked((int)0x800701B1)   // ERROR_NO_SUCH_DEVICE
+        || hr == unchecked((int)0x80070079)   // ERROR_SEM_TIMEOUT
+        || hr == unchecked((int)0x800700AA)   // ERROR_BUSY
+        || hr == unchecked((int)0x80070006);  // ERROR_INVALID_HANDLE
+
     public static void Check(int hr, string what)
     {
         if (hr < 0)

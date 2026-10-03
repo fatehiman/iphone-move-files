@@ -33,8 +33,19 @@ internal sealed class MoveEngine(
     bool deleteAfterCopy,
     IProgress<FileReport> report,
     Action<long> onBytes,
-    Func<string, bool>? askForSpace = null)
+    Func<string, bool>? askUser = null,
+    Action<string>? info = null)
 {
+    /// <summary>The session with the phone broke in the middle of a photo.</summary>
+    private sealed class ConnectionLostException(int hr, Exception? inner = null)
+        : Exception("connection to the iPhone lost: " + WpdException.Describe(hr), inner);
+
+    /// <summary>How often one photo is tried again after a reconnect before it counts as failed.</summary>
+    public const int MaxReconnectsPerPhoto = 3;
+    private static readonly int[] ReconnectDelaysSeconds = [2, 5, 10, 20, 30];
+
+    private bool reconnectAllowed;
+
     /// <summary>Pause when the destination drive has less free space than this.</summary>
     public const long MinFreeSpace = 1L << 30; // 1 GB
 
@@ -60,9 +71,24 @@ internal sealed class MoveEngine(
         {
             foreach (var group in groups)
             {
-                ct.ThrowIfCancellationRequested();
-                WaitForFreeSpace(group, ct);
-                RunGroup(group, summary, ct);
+                for (int attempt = 1; ; attempt++)
+                {
+                    ct.ThrowIfCancellationRequested();
+                    WaitForFreeSpace(group, ct);
+                    reconnectAllowed = attempt <= MaxReconnectsPerPhoto;
+                    try
+                    {
+                        RunGroup(group, summary, ct);
+                        break;
+                    }
+                    catch (ConnectionLostException ex)
+                    {
+                        // Files already copied are found on the PC next time ("already on PC"), so repeating is safe.
+                        info?.Invoke($"{group[0].DevicePath}: {ex.Message}. Reconnecting...");
+                        Reconnect(ct);
+                        failuresInRow = 0;
+                    }
+                }
                 if (failuresInRow >= MaxFailuresInRow)
                     throw new IOException($"Stopped: {failuresInRow} files failed one after another. " +
                                           "Is the iPhone still connected and unlocked? Start the move again to continue.");
@@ -95,10 +121,47 @@ internal sealed class MoveEngine(
                 $"The destination drive {drive.Name} has only {free / (1024.0 * 1024 * 1024):0.00} GB free.\n\n" +
                 "The move is paused. Please free some space on this drive, then click Retry.\n" +
                 "Click Cancel to stop the move (you can continue later).";
-            if (askForSpace is null || !askForSpace(message))
+            if (askUser is null || !askUser(message))
                 throw new OperationCanceledException("Stopped: not enough free space on " + drive.Name);
         }
     }
+
+    /// <summary>
+    /// Opens a new session with the phone: first automatically a few times (with waits),
+    /// then by asking the user to unlock or replug the phone (Retry / Cancel).
+    /// </summary>
+    private void Reconnect(CancellationToken ct)
+    {
+        foreach (int seconds in ReconnectDelaysSeconds)
+        {
+            if (ct.WaitHandle.WaitOne(TimeSpan.FromSeconds(seconds)))
+                ct.ThrowIfCancellationRequested();
+            if (device.Reconnect())
+            {
+                info?.Invoke("Reconnected to the iPhone. Continuing.");
+                return;
+            }
+        }
+        while (true)
+        {
+            const string message =
+                "The connection to the iPhone was lost, and it did not come back by itself.\n\n" +
+                "1. Unlock the iPhone.\n" +
+                "2. If that does not help: unplug the cable, plug it in again, and tap \"Trust\" on the iPhone.\n\n" +
+                "Then click Retry. The move continues with the same photo.\n" +
+                "Click Cancel to stop the move (you can continue later).";
+            if (askUser is null || !askUser(message))
+                throw new OperationCanceledException("Stopped: the connection to the iPhone was lost.");
+            ct.ThrowIfCancellationRequested();
+            if (device.Reconnect())
+            {
+                info?.Invoke("Reconnected to the iPhone. Continuing.");
+                return;
+            }
+        }
+    }
+
+    private static int HResultOf(Exception ex) => ex is WpdException w ? w.HResult32 : ex.HResult;
 
     /// <summary>One photo: copy and check all its files, then delete them from the phone.</summary>
     private void RunGroup(List<DeviceFile> group, MoveSummary summary, CancellationToken ct)
@@ -123,6 +186,10 @@ internal sealed class MoveEngine(
             catch (OperationCanceledException)
             {
                 throw;
+            }
+            catch (Exception ex) when (reconnectAllowed && HResult.IsConnectionLost(HResultOf(ex)))
+            {
+                throw new ConnectionLostException(HResultOf(ex), ex);
             }
             catch (Exception ex)
             {
@@ -256,11 +323,15 @@ internal sealed class MoveEngine(
         int hr = device.Delete(file.ObjectId);
         if (HResult.IsNotFound(hr))
             return null; // iOS already removed it together with another file of the same photo
+        if (reconnectAllowed && HResult.IsConnectionLost(hr))
+            throw new ConnectionLostException(hr);
 
         if (hr < 0 || hr == HResult.S_FALSE)
         {
             // Fallback: send the PTP DeleteObject operation directly to the phone.
             var ptp = device.PtpDelete(file.ObjectId);
+            if (reconnectAllowed && HResult.IsConnectionLost(ptp.HResult))
+                throw new ConnectionLostException(ptp.HResult);
             if (!ptp.Ok && ptp.ResponseCode != 0x2009 /* already gone */)
                 return $"NOT deleted: WPD delete gave {WpdException.Describe(hr)}, PTP DeleteObject gave {ptp}." +
                        (hr == HResult.E_ACCESSDENIED ? ReadOnlyHint : "");

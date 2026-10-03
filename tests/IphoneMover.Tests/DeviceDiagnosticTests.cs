@@ -33,6 +33,18 @@ public sealed class DeviceDiagnosticTests(ITestOutputHelper output)
         output.WriteLine("GetObjectInfo 0x0FFFFFF0: " + device.MtpReadCommand(0x1008, 0x0FFFFFF0));
         output.WriteLine($"ExistsOnPhone(o0FFFFFF0) = {device.ExistsOnPhone("o0FFFFFF0")}");
 
+        // Reconnect: a new session must work, and the object ids (MTP handles) must stay the same.
+        var sw2 = System.Diagnostics.Stopwatch.StartNew();
+        bool ok = device.Reconnect();
+        output.WriteLine($"Reconnect = {ok} in {sw2.ElapsedMilliseconds} ms; " +
+                         $"ExistsOnPhone({files[0].ObjectId}) after reconnect = {device.ExistsOnPhone(files[0].ObjectId)}");
+        using (var ms = new MemoryStream())
+        {
+            var small = files.Where(f => f.Size > 0).MinBy(f => f.Size)!;
+            long n = device.Download(small.ObjectId, ms, null, CancellationToken.None);
+            output.WriteLine($"Download {small.DevicePath} after reconnect: {n} of {small.Size} bytes");
+        }
+
         // PTP GetDeviceInfo (0x1001): which operations does the phone support?
         var di = device.MtpReadCommand(0x1001);
         output.WriteLine("GetDeviceInfo: " + di);
