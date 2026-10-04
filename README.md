@@ -35,6 +35,8 @@ A small Windows app that **moves** photos and videos from an iPhone (connected w
 - **Safe for long runs**: the PC does not go to sleep during a move.
 - **Reconnects by itself**: if the connection to the phone breaks (phone locked or asleep, USB reset), the app opens a new connection and repeats the same photo. If the phone does not come back after about 1 minute, the move **pauses** and asks you to unlock or replug the iPhone (Retry / Cancel).
 - The move stops after 10 failures in a row that are not connection problems.
+- **Delay slider** (top row, 0–500 ms, default **75 ms**): a pause after each phone action (read a file, delete a file, list a folder, check a delete). This gives the phone time and makes long moves more stable. While you drag the slider, the old value stays in use. The new value is used when you release the mouse button, also during a move. 75 ms worked well for a long move of 25,000 files.
+- While a move runs, the check boxes on the left are locked.
 - **PC side**: right-click menu with Open, Show in Explorer, New folder, Rename (F2), Delete to Recycle Bin (Del), and Delete permanently (Shift+Del).
 - **Remembers** the device, the view, the phone folder, and the PC folder. On start, it loads the phone automatically. If something is not found, it uses the first device or drive.
 

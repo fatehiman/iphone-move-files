@@ -15,6 +15,7 @@ internal static class Settings
         public string? DeviceName { get; set; }     // fallback when the id changed (other USB port)
         public bool FolderView { get; set; } = true; // left side: folders (true) or files (false)
         public string? PhoneFolder { get; set; }    // folder filter in file view; null = all folders
+        public int ActionDelayMs { get; set; } = 75; // pause after each phone action (0-500 ms)
     }
 
     public static Data Current { get; } = Load();

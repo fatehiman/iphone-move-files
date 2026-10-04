@@ -39,6 +39,31 @@ internal sealed class WpdDevice : IDisposable
 
     public DeviceInfo Info { get; private set; }
 
+    private static volatile int actionDelayMs = 75;
+
+    /// <summary>
+    /// Pause after each action with the phone (read a file, delete a file, list a folder, PTP command),
+    /// to give the phone time. Can be changed while a move runs.
+    /// </summary>
+    public static int ActionDelayMs
+    {
+        get => actionDelayMs;
+        set => actionDelayMs = Math.Clamp(value, 0, 5000);
+    }
+
+    /// <summary>Runs one phone action on the WPD thread, then waits <see cref="ActionDelayMs"/>.</summary>
+    private static T Act<T>(Func<T> action) => Worker.Invoke(() =>
+    {
+        try { return action(); }
+        finally { PauseAfterAction(); }
+    });
+    private static void PauseAfterAction()
+    {
+        int ms = actionDelayMs;
+        if (ms > 0)
+            Thread.Sleep(ms);
+    }
+
     private WpdDevice(DeviceInfo info) => Info = info;
 
     // ---------------------------------------------------------------- devices
@@ -173,7 +198,7 @@ internal sealed class WpdDevice : IDisposable
     // ---------------------------------------------------------------- listing
 
     /// <summary>
-    /// Lists all files on the device (recursive). Reports "folder — N files" as progress.
+    /// Lists all files on the device (recursive). Reports "folder Ã¢â‚¬â€ N files" as progress.
     /// Throws when the connection to the phone is lost (so a cut list is never shown as complete).
     /// </summary>
     public List<DeviceFile> ListFiles(IProgress<string>? progress, CancellationToken ct) => Worker.Invoke(() =>
@@ -190,7 +215,7 @@ internal sealed class WpdDevice : IDisposable
         if (depth > 32)
             return;
         string label = folder.Length == 0 ? "\\" : folder;
-        progress?.Report($"{label} — {files.Count:N0} files");
+        progress?.Report($"{label} Ã¢â‚¬â€ {files.Count:N0} files");
 
         foreach (string id in EnumChildren(parentId))
         {
@@ -199,7 +224,7 @@ internal sealed class WpdDevice : IDisposable
             if (obj is null)
                 continue;
             if (files.Count % 200 == 199)
-                progress?.Report($"{label} — {files.Count + 1:N0} files");
+                progress?.Report($"{label} Ã¢â‚¬â€ {files.Count + 1:N0} files");
 
             if (obj.Value.IsContainer)
             {
@@ -240,6 +265,7 @@ internal sealed class WpdDevice : IDisposable
         finally
         {
             Marshal.ReleaseComObject(en);
+            PauseAfterAction(); // listing one folder is one action
         }
         return ids;
     }
@@ -359,7 +385,7 @@ internal sealed class WpdDevice : IDisposable
     // ---------------------------------------------------------------- transfer
 
     /// <summary>Copies the file content into <paramref name="target"/>. Returns the number of bytes written.</summary>
-    public long Download(string objectId, Stream target, Action<long>? onBytes, CancellationToken ct) => Worker.Invoke(() =>
+    public long Download(string objectId, Stream target, Action<long>? onBytes, CancellationToken ct) => Act(() =>
     {
         HResult.Check(content!.Transfer(out var resources), "IPortableDeviceContent.Transfer");
         IStream? stream = null;
@@ -398,7 +424,7 @@ internal sealed class WpdDevice : IDisposable
     });
 
     /// <summary>Deletes one object. Returns the HRESULT (S_OK = deleted, S_FALSE = refused by the phone).</summary>
-    public int Delete(string objectId) => Worker.Invoke(() =>
+    public int Delete(string objectId) => Act(() =>
     {
         var ids = WpdClsid.Create<IPortableDevicePropVariantCollection>(WpdClsid.PortableDevicePropVariantCollection);
         var pv = new PropVariant { vt = PropVariant.VT_LPWSTR, ptr = Marshal.StringToCoTaskMemUni(objectId) };
@@ -426,7 +452,7 @@ internal sealed class WpdDevice : IDisposable
     }
 
     /// <summary>Sends an MTP/PTP operation that has no data phase (for example DeleteObject 0x100B).</summary>
-    public MtpResult MtpCommand(ushort opcode, params uint[] args) => Worker.Invoke(() =>
+    public MtpResult MtpCommand(ushort opcode, params uint[] args) => Act(() =>
     {
         var p = NewCommand(WpdKeys.MtpExtExecuteWithoutData);
         var k = WpdKeys.MtpExtOperationCode; p.SetUnsignedIntegerValue(ref k, opcode);
@@ -438,7 +464,7 @@ internal sealed class WpdDevice : IDisposable
     });
 
     /// <summary>Sends an MTP/PTP operation that returns data (for example GetDeviceInfo 0x1001).</summary>
-    public MtpResult MtpReadCommand(ushort opcode, params uint[] args) => Worker.Invoke(() =>
+    public MtpResult MtpReadCommand(ushort opcode, params uint[] args) => Act(() =>
     {
         var p = NewCommand(WpdKeys.MtpExtExecuteWithDataToRead);
         var k = WpdKeys.MtpExtOperationCode; p.SetUnsignedIntegerValue(ref k, opcode);

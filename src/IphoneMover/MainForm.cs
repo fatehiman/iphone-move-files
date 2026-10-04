@@ -13,6 +13,12 @@ internal sealed class MainForm : Form
     private readonly ComboBox deviceCombo = new() { DropDownStyle = ComboBoxStyle.DropDownList, Width = 320 };
     private readonly Button findDevicesButton = new() { Text = "Find devices", AutoSize = true };
     private readonly Button loadFilesButton = new() { Text = "Reload files from phone", AutoSize = true };
+    private readonly TrackBar delayBar = new()
+    {
+        Minimum = 0, Maximum = 500, TickFrequency = 50, SmallChange = 10, LargeChange = 50,
+        Width = 220, AutoSize = false, Height = 30, TickStyle = TickStyle.BottomRight,
+    };
+    private readonly Label delayLabel = new() { AutoSize = true, Padding = new Padding(0, 6, 0, 0), MinimumSize = new Size(150, 0) };
 
     // left: phone
     private readonly RadioButton folderViewRadio = new() { Text = "Folders", AutoSize = true, Padding = new Padding(0, 4, 0, 0) };
@@ -71,6 +77,8 @@ internal sealed class MainForm : Form
     private readonly Dictionary<string, (string Text, Color Color)> statusById = [];
     private bool countDirty;
     private bool filling;          // ignore ItemChecked / SelectedIndexChanged while the code fills lists
+    private bool busy;             // a move or a reload runs: the user cannot check or uncheck rows
+    private Button[] checkButtons = [];
     private int sortColumn = 1;
     private bool sortAscending = true;
 
@@ -111,7 +119,9 @@ internal sealed class MainForm : Form
     {
         var top = new FlowLayoutPanel { Dock = DockStyle.Top, AutoSize = true, Padding = new Padding(6), WrapContents = false };
         top.Controls.AddRange([new Label { Text = "iPhone:", AutoSize = true, Padding = new Padding(0, 6, 0, 0) },
-            deviceCombo, findDevicesButton, loadFilesButton]);
+            deviceCombo, findDevicesButton, loadFilesButton,
+            new Label { Text = "Delay after each phone action:", AutoSize = true, Padding = new Padding(24, 6, 0, 0) },
+            delayBar, delayLabel]);
 
         folderList.Columns.Add("Folder", 140);
         folderList.Columns.Add("Files", 70, HorizontalAlignment.Right);
@@ -148,6 +158,7 @@ internal sealed class MainForm : Form
         selectNone.Click += (_, _) => UncheckAll();
         checkSelected.Click += (_, _) => CheckSelectedRows();
         phoneTools.Controls.AddRange([selectAll, selectNone, checkSelected, phoneCountLabel]);
+        checkButtons = [selectAll, selectNone, checkSelected];
 
         var left = new Panel { Dock = DockStyle.Fill };
         left.Controls.Add(folderList);
@@ -214,8 +225,24 @@ internal sealed class MainForm : Form
         cancelButton.Click += (_, _) => cts?.Cancel();
         deviceCombo.SelectionChangeCommitted += (_, _) => RememberDevice();
 
+        // Delay slider: while the mouse button is down only the label changes;
+        // the new delay is used when the button is released. Keyboard and mouse wheel apply at once.
+        delayBar.Value = Math.Clamp(Settings.Current.ActionDelayMs, delayBar.Minimum, delayBar.Maximum);
+        ApplyDelay(log: false);
+        delayBar.ValueChanged += (_, _) =>
+        {
+            if (MouseButtons == MouseButtons.None)
+                ApplyDelay(log: true);
+            else
+                delayLabel.Text = $"{delayBar.Value} ms (release to apply)";
+        };
+        delayBar.MouseUp += (_, _) => ApplyDelay(log: true);
+
         folderViewRadio.CheckedChanged += (_, _) => { if (!filling) ApplyViewMode(); };
         folderList.ItemChecked += OnFolderChecked;
+        // While busy, a click on a check box is undone (changes made by the code itself are allowed).
+        folderList.ItemCheck += BlockUserCheckWhileBusy;
+        phoneList.ItemCheck += BlockUserCheckWhileBusy;
         folderList.DoubleClick += (_, _) => OpenFolderInFileView();
         phoneList.ItemChecked += OnFileChecked;
         phoneList.ColumnClick += (_, e) => SortPhoneList(e.Column);
@@ -278,6 +305,19 @@ internal sealed class MainForm : Form
             await LoadPhoneFilesAsync();
     }
 
+    private void ApplyDelay(bool log)
+    {
+        int ms = delayBar.Value;
+        delayLabel.Text = $"{ms} ms";
+        if (WpdDevice.ActionDelayMs == ms && !log)
+            return;
+        bool changed = WpdDevice.ActionDelayMs != ms;
+        WpdDevice.ActionDelayMs = ms;
+        Settings.Current.ActionDelayMs = ms;
+        if (log && changed)
+            Log($"Delay after each phone action is now {ms} ms.");
+    }
+
     private void RememberDevice()
     {
         if (deviceCombo.SelectedItem is DeviceInfo d)
@@ -297,6 +337,10 @@ internal sealed class MainForm : Form
 
         cts = new CancellationTokenSource();
         SetBusy(true, "Reading the file list from the phone...");
+        // Forget the progress of an earlier move.
+        progressBar.Value = 0;
+        filesDone = filesTotal = 0;
+        progressBytes = progressTotal = 0;
         try
         {
             // Always a new session: an old one may be broken (phone was locked, cable moved).
@@ -526,6 +570,12 @@ internal sealed class MainForm : Form
             if (((FolderFilter)folderCombo.Items[i]!).Folder == folder)
                 folderCombo.SelectedIndex = i; // fires FillFileList
         fileViewRadio.Checked = true;
+    }
+
+    private void BlockUserCheckWhileBusy(object? sender, ItemCheckEventArgs e)
+    {
+        if (busy && !filling)
+            e.NewValue = e.CurrentValue;
     }
 
     private void OnFolderChecked(object? sender, ItemCheckedEventArgs e)
@@ -962,7 +1012,8 @@ internal sealed class MainForm : Form
         progressStart = DateTime.Now;
         SetBusy(true, "Moving...");
         progressTimer.Start();
-        Log($"--- {(delete ? "MOVE" : "COPY")} {all.Count:N0} files from {folders.Count:N0} folder(s) to {dest}");
+        Log($"--- {(delete ? "MOVE" : "COPY")} {all.Count:N0} files from {folders.Count:N0} folder(s) to {dest} " +
+            $"(delay {WpdDevice.ActionDelayMs} ms after each phone action)");
 
         var report = new Progress<FileReport>(OnFileReport);
         var engine = new MoveEngine(device, dest, delete, report, n => Interlocked.Exchange(ref progressBytes, n),
@@ -1121,6 +1172,9 @@ internal sealed class MainForm : Form
 
     private void SetBusy(bool busy, string? status = null)
     {
+        this.busy = busy;
+        foreach (var b in checkButtons)
+            b.Enabled = !busy;
         findDevicesButton.Enabled = !busy;
         loadFilesButton.Enabled = !busy;
         deviceCombo.Enabled = !busy;
